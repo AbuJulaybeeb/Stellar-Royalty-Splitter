@@ -52,6 +52,7 @@ import { docsRouter } from "./routes/docs.js";
 import { tiersRouter } from "./routes/tiers.js";
 import { attachRole } from "./middleware/rbac.js";
 import { csvImportRouter } from "./routes/csv-import.js";
+import { quickbooksRouter } from "./routes/accounting/quickbooks.js";
 import { contributorTaxRouter } from "./routes/contributor-tax.js";
 import { notificationsRouter } from "./routes/notifications.js";
 import { salesforceRouter } from "./routes/crm/salesforce.js";
@@ -334,6 +335,7 @@ app.use("/api/v1/secondary-royalty", writeLimiter);
 app.use("/api/v1/webhooks", writeLimiter);
 app.use("/api/v1/onboarding", writeLimiter);
 app.use("/api/v1/simulate", simulateLimiter);
+app.use("/api/v1/accounting", writeLimiter);
 
 // Apply read limiter to high-fan-out query endpoints (#394 — MEDIUM-16)
 app.use("/api/v1/analytics", readLimiter);
@@ -384,6 +386,9 @@ app.use("/api/v1/docs", docsRouter);
 
 // CSV bulk import (#597)
 app.use("/api/v1/csv-import", csvImportRouter);
+
+// QuickBooks accounting sync (#940)
+app.use("/api/v1/accounting/quickbooks", quickbooksRouter);
 
 // Contributor tax information (#595)
 app.use("/api/v1/contributor-tax", contributorTaxRouter);

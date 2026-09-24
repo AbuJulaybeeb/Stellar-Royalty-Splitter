@@ -1,6 +1,9 @@
 use soroban_sdk::unwrap::UnwrapOptimized;
 pub mod auth;
 mod storage;
+pub use storage::{
+    LinkedPool, MetadataBinding, MetadataRateCache, MAX_LINKED_POOLS, METADATA_CACHE_TTL_SECS,
+};
 // CI workflow verification: all checks passing
 // Trigger contract CI workflow
 
@@ -255,6 +258,22 @@ pub enum StorageKey {
     RecipientEarnings(Address, Address),
     DistributionRecords,
     PendingDistributions,
+    /// Newer keys, nested so `StorageKey` stays under the contract-spec limit
+    /// of 50 variants.
+    Ext(ExtKey),
+}
+
+/// Storage keys added after `StorageKey` reached the contract-spec variant
+/// limit. Always used as `StorageKey::Ext(ExtKey::..)`.
+#[contracttype]
+#[derive(Clone)]
+pub enum ExtKey {
+    /// #933 — `MetadataBinding` (instance storage).
+    MetadataBinding,
+    /// #933 — cached oracle answer per (collection, token id) (temporary storage).
+    MetadataRateCache(Address, u64),
+    /// #932 — `Vec<LinkedPool>` (persistent storage).
+    LinkedContracts,
 }
 
 /// Maximum number of rate-change entries kept in history.
@@ -404,6 +423,25 @@ pub enum ContractError {
     InvalidEmergencyPauseSigners = 48,
     InvalidEmergencyPauseThreshold = 49,
     UnauthorizedEmergencySigner = 50,
+}
+
+/// `ContractError` is at the contract-spec limit of 50 variants, so the
+/// metadata-binding (#933) and linked-pool (#932) failures reuse the closest
+/// existing codes. These names document which code means what.
+impl ContractError {
+    /// `unbind_nft_metadata` with no binding in place.
+    pub const NO_METADATA_BINDING: Self = Self::NotInitialized;
+    /// `link_pool` target is this contract itself, or is already linked.
+    pub const POOL_ALREADY_LINKED: Self = Self::DuplicateRecipient;
+    /// `link_pool` target is not an initialized royalty splitter.
+    pub const INVALID_LINKED_POOL: Self = Self::NoShareMap;
+    /// `link_pool` target's own shares do not sum to 10,000, or the links
+    /// together would claim more than 10,000 basis points.
+    pub const INVALID_LINKED_SHARE_TOTAL: Self = Self::InvalidShareTotal;
+    /// `link_pool` would exceed `MAX_LINKED_POOLS`.
+    pub const TOO_MANY_LINKED_POOLS: Self = Self::TooManyRecipients;
+    /// `unlink_pool` for a source that is not linked.
+    pub const POOL_NOT_LINKED: Self = Self::CollaboratorNotFound;
 }
 
 #[contract]
@@ -1309,7 +1347,8 @@ impl RoyaltySplitter {
         }
 
         let recipients_to_use = Self::resolve_recipients(&env, override_recipients)?;
-        let payouts = Self::calculate_payouts(&env, amount, &recipients_to_use)?;
+        let (forwards, local_amount) = Self::linked_forwards(&env, amount)?; // #932
+        let payouts = Self::local_payouts(&env, local_amount, &recipients_to_use)?;
         let recipient_count = recipients_to_use.len();
 
         // ── Checks-Effects-Interactions (CEI) Pattern ─────────────────────────
@@ -1339,6 +1378,7 @@ impl RoyaltySplitter {
             &current_count.saturating_add(1),
         );
 
+        Self::pay_linked_forwards(&env, &token_client, &token, &forwards);
         for (addr, payout) in payouts.iter() {
             token_client.transfer(&env.current_contract_address(), &addr, &payout);
             let total_earned = Self::record_recipient_earnings(&env, &addr, &token, payout)?;
@@ -1476,6 +1516,234 @@ impl RoyaltySplitter {
         Ok(failed)
     }
 
+    // ─────────────────────────────────────────────────────────────────────
+    // #932 — Linked pools
+    //
+    // A contract can link to one or more other royalty-splitter contracts
+    // ("source" pools). Each link carries a basis-point `share`: on every
+    // primary distribution that share of the balance is transferred to the
+    // source contract, whose own collaborators are paid when the source
+    // distributes. Only the remainder is split among local recipients, so
+    // collaborators configured once in the source contract are paid from
+    // every linked project without being re-entered here.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Admin: forward `share` basis points of every primary distribution to
+    /// `source_contract`. The source must be an initialized royalty splitter
+    /// whose shares sum to 10,000; links may together claim at most 10,000.
+    pub fn link_pool(env: Env, source_contract: Address, share: u32) -> Result<(), ContractError> {
+        storage::extend_instance_ttl(&env);
+        Self::check_admin_auth(&env, "link_pool: admin authorization required");
+
+        if source_contract == env.current_contract_address() {
+            return Err(ContractError::POOL_ALREADY_LINKED);
+        }
+        if share == 0 || share > 10_000 {
+            return Err(ContractError::InvalidBasisPoints);
+        }
+
+        let mut links = Self::linked_pools(&env);
+        if links.len() >= MAX_LINKED_POOLS {
+            return Err(ContractError::TOO_MANY_LINKED_POOLS);
+        }
+        let mut total = share;
+        for link in links.iter() {
+            if link.source_contract == source_contract {
+                return Err(ContractError::POOL_ALREADY_LINKED);
+            }
+            total = Self::checked_add_share_total(&env, total, link.share)?;
+        }
+        if total > 10_000 {
+            return Err(ContractError::INVALID_LINKED_SHARE_TOTAL);
+        }
+
+        // `is_initialized` never panics, so ask it first: `get_total_shares`
+        // traps on an uninitialized contract.
+        let source_initialized = env
+            .try_invoke_contract::<bool, soroban_sdk::InvokeError>(
+                &source_contract,
+                &Symbol::new(&env, "is_initialized"),
+                Vec::new(&env),
+            )
+            .map_err(|_| ContractError::INVALID_LINKED_POOL)?
+            .map_err(|_| ContractError::INVALID_LINKED_POOL)?;
+        if !source_initialized {
+            return Err(ContractError::INVALID_LINKED_POOL);
+        }
+        let source_total = env
+            .try_invoke_contract::<u32, soroban_sdk::InvokeError>(
+                &source_contract,
+                &Symbol::new(&env, "get_total_shares"),
+                Vec::new(&env),
+            )
+            .map_err(|_| ContractError::INVALID_LINKED_POOL)?
+            .map_err(|_| ContractError::INVALID_LINKED_POOL)?;
+        if source_total != 10_000 {
+            return Err(ContractError::INVALID_LINKED_SHARE_TOTAL);
+        }
+
+        links.push_back(LinkedPool {
+            source_contract: source_contract.clone(),
+            share,
+        });
+        storage::persistent_set(&env, &StorageKey::Ext(ExtKey::LinkedContracts), &links);
+        env.events().publish(
+            (symbol_short!("pool"), symbol_short!("linked")),
+            (source_contract, share),
+        );
+        Ok(())
+    }
+
+    /// Admin: remove the link to `source_contract`.
+    pub fn unlink_pool(env: Env, source_contract: Address) -> Result<(), ContractError> {
+        storage::extend_instance_ttl(&env);
+        Self::check_admin_auth(&env, "unlink_pool: admin authorization required");
+
+        let mut links = Self::linked_pools(&env);
+        let index = links
+            .iter()
+            .position(|link| link.source_contract == source_contract)
+            .ok_or(ContractError::POOL_NOT_LINKED)?;
+        links.remove(index as u32);
+        storage::persistent_set(&env, &StorageKey::Ext(ExtKey::LinkedContracts), &links);
+        env.events().publish(
+            (symbol_short!("pool"), symbol_short!("unlinked")),
+            source_contract,
+        );
+        Ok(())
+    }
+
+    pub fn get_linked_pools(env: Env) -> Vec<LinkedPool> {
+        storage::extend_instance_ttl(&env);
+        Self::linked_pools(&env)
+    }
+
+    /// Effective basis-point share of every address that ultimately receives
+    /// part of a primary distribution: local recipients scaled to the portion
+    /// not forwarded, plus each linked pool's collaborators scaled to that
+    /// link's share. An address present in several pools is summed. If a
+    /// source pool cannot be queried its whole share is attributed to the
+    /// source contract itself, which is where the tokens go.
+    ///
+    /// Values are floored per entry, so the total can fall a few basis points
+    /// short of 10,000; payouts themselves assign that dust exactly.
+    pub fn get_effective_shares(env: Env) -> Map<Address, u32> {
+        storage::extend_instance_ttl(&env);
+
+        let links = Self::linked_pools(&env);
+        let mut linked_total: u32 = 0;
+        for link in links.iter() {
+            linked_total = linked_total.saturating_add(link.share);
+        }
+        let local_share = 10_000u32.saturating_sub(linked_total);
+
+        let mut effective: Map<Address, u32> = Map::new(&env);
+        if local_share > 0 {
+            let local = Self::resolve_recipients(&env, Vec::new(&env)).unwrap_or(Vec::new(&env));
+            for recipient in local.iter() {
+                Self::add_scaled_share(
+                    &mut effective,
+                    recipient.address,
+                    recipient.share,
+                    local_share,
+                );
+            }
+        }
+
+        for link in links.iter() {
+            let source_shares = env
+                .try_invoke_contract::<Map<Address, u32>, soroban_sdk::InvokeError>(
+                    &link.source_contract,
+                    &Symbol::new(&env, "get_all_shares"),
+                    Vec::new(&env),
+                )
+                .ok()
+                .and_then(|result| result.ok())
+                .filter(|shares| !shares.is_empty());
+            match source_shares {
+                Some(shares) => {
+                    for (address, share) in shares.iter() {
+                        Self::add_scaled_share(&mut effective, address, share, link.share);
+                    }
+                }
+                None => {
+                    Self::add_scaled_share(&mut effective, link.source_contract, 10_000, link.share)
+                }
+            }
+        }
+        effective
+    }
+
+    fn add_scaled_share(
+        effective: &mut Map<Address, u32>,
+        address: Address,
+        share: u32,
+        scale: u32,
+    ) {
+        // share, scale <= 10_000, so the product fits in u64 and the result in u32.
+        let scaled = (share as u64)
+            .checked_mul(scale as u64)
+            .and_then(|product| product.checked_div(10_000))
+            .unwrap_or(0) as u32;
+        let current = effective.get(address.clone()).unwrap_or(0);
+        effective.set(address, current.saturating_add(scaled));
+    }
+
+    fn linked_pools(env: &Env) -> Vec<LinkedPool> {
+        storage::persistent_get(env, &StorageKey::Ext(ExtKey::LinkedContracts))
+            .unwrap_or(Vec::new(env))
+    }
+
+    /// Split `amount` into the portions owed to each linked pool and the
+    /// remainder left for local recipients. Pure: no state is touched, so it
+    /// can run in the checks phase ahead of any storage write.
+    fn linked_forwards(
+        env: &Env,
+        amount: i128,
+    ) -> Result<(Vec<(Address, i128)>, i128), ContractError> {
+        let mut forwards = Vec::new(env);
+        let mut remaining = amount;
+        for link in Self::linked_pools(env).iter() {
+            let forwarded = Self::checked_bps_amount(env, amount, link.share)?;
+            if forwarded == 0 {
+                continue;
+            }
+            remaining = remaining
+                .checked_sub(forwarded)
+                .ok_or(ContractError::ArithmeticOverflow)?;
+            forwards.push_back((link.source_contract, forwarded));
+        }
+        Ok((forwards, remaining))
+    }
+
+    fn pay_linked_forwards(
+        env: &Env,
+        token_client: &token::Client,
+        token: &Address,
+        forwards: &Vec<(Address, i128)>,
+    ) {
+        for (source, forwarded) in forwards.iter() {
+            token_client.transfer(&env.current_contract_address(), &source, &forwarded);
+            env.events().publish(
+                (symbol_short!("pool"), symbol_short!("forward")),
+                (source, forwarded, token.clone()),
+            );
+        }
+    }
+
+    /// Payouts for the local share of a distribution. Empty when every token
+    /// is forwarded to linked pools.
+    fn local_payouts(
+        env: &Env,
+        local_amount: i128,
+        recipients: &Vec<Recipient>,
+    ) -> Result<Vec<(Address, i128)>, ContractError> {
+        if local_amount == 0 {
+            return Ok(Vec::new(env));
+        }
+        Self::calculate_payouts(env, local_amount, recipients)
+    }
+
     pub fn get_distribute_count(env: Env) -> u64 {
         storage::extend_instance_ttl(&env);
         env.storage()
@@ -1562,8 +1830,10 @@ impl RoyaltySplitter {
                 return Err(ContractError::NoBalance);
             }
 
-            let payouts = Self::calculate_payouts(&env, amount, &recipients_to_use)?;
+            let (forwards, local_amount) = Self::linked_forwards(&env, amount)?; // #932
+            let payouts = Self::local_payouts(&env, local_amount, &recipients_to_use)?;
 
+            Self::pay_linked_forwards(&env, &token_client, &token, &forwards);
             for (addr, payout) in payouts.iter() {
                 token_client.transfer(&env.current_contract_address(), &addr, &payout);
                 let total_earned = Self::record_recipient_earnings(&env, &addr, &token, payout)?;
@@ -1836,6 +2106,171 @@ impl RoyaltySplitter {
             .unwrap_or(0);
 
         Self::checked_bps_amount(&env, sale_price, rate)
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // #933 — NFT metadata binding for dynamic rates
+    //
+    // The admin binds the contract to an NFT collection and an external
+    // metadata oracle. On a secondary sale of token `token_id`, the oracle's
+    // `get_rate_override(collection, token_id) -> Option<u32>` is consulted
+    // and, when it returns a valid basis-point rate, that rate replaces the
+    // default `RoyaltyRate` for that sale only.
+    //
+    // Answers (including "no override") are cached per token for
+    // `METADATA_CACHE_TTL_SECS`. An unreachable or misbehaving oracle never
+    // fails the sale: the default rate is used and nothing is cached, so the
+    // next sale retries the oracle.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Admin: bind this contract to an NFT collection and its metadata oracle.
+    /// Rebinding replaces the previous binding; cache entries written by a
+    /// different oracle or for a different collection are ignored thereafter.
+    pub fn bind_to_nft_metadata(
+        env: Env,
+        collection_addr: Address,
+        metadata_oracle_addr: Address,
+    ) -> Result<(), ContractError> {
+        storage::extend_instance_ttl(&env);
+        Self::check_admin_auth(&env, "bind_to_nft_metadata: admin authorization required");
+        let binding = MetadataBinding {
+            collection_address: collection_addr.clone(),
+            metadata_oracle: metadata_oracle_addr.clone(),
+        };
+        storage::instance_set(&env, &StorageKey::Ext(ExtKey::MetadataBinding), &binding);
+        env.events().publish(
+            (symbol_short!("royalty"), symbol_short!("md_bind")),
+            (collection_addr, metadata_oracle_addr),
+        );
+        Ok(())
+    }
+
+    /// Admin: remove the metadata binding. Sales revert to the default rate.
+    pub fn unbind_nft_metadata(env: Env) -> Result<(), ContractError> {
+        storage::extend_instance_ttl(&env);
+        Self::check_admin_auth(&env, "unbind_nft_metadata: admin authorization required");
+        if !env
+            .storage()
+            .instance()
+            .has(&StorageKey::Ext(ExtKey::MetadataBinding))
+        {
+            return Err(ContractError::NO_METADATA_BINDING);
+        }
+        env.storage()
+            .instance()
+            .remove(&StorageKey::Ext(ExtKey::MetadataBinding));
+        env.events()
+            .publish((symbol_short!("royalty"), symbol_short!("md_unbind")), ());
+        Ok(())
+    }
+
+    pub fn get_metadata_binding(env: Env) -> Option<MetadataBinding> {
+        storage::extend_instance_ttl(&env);
+        storage::instance_get(&env, &StorageKey::Ext(ExtKey::MetadataBinding))
+    }
+
+    /// Royalty for the secondary sale of NFT `token_id`, using the metadata
+    /// oracle's rate override when one applies and the default rate otherwise.
+    pub fn record_nft_secondary_sale(
+        env: Env,
+        token_id: u64,
+        sale_price: i128,
+    ) -> Result<i128, ContractError> {
+        storage::extend_instance_ttl(&env);
+
+        if sale_price <= 0 {
+            return Err(ContractError::SalePriceNotPositive);
+        }
+
+        let rate = Self::effective_nft_rate(&env, token_id);
+        Self::checked_bps_amount(&env, sale_price, rate)
+    }
+
+    /// The rate `record_nft_secondary_sale` would apply to `token_id` right
+    /// now. Populates the cache exactly as a sale would.
+    pub fn get_nft_royalty_rate(env: Env, token_id: u64) -> u32 {
+        storage::extend_instance_ttl(&env);
+        Self::effective_nft_rate(&env, token_id)
+    }
+
+    fn effective_nft_rate(env: &Env, token_id: u64) -> u32 {
+        let default_rate: u32 = env
+            .storage()
+            .instance()
+            .get(&StorageKey::RoyaltyRate)
+            .unwrap_or(0);
+
+        let binding: MetadataBinding =
+            match storage::instance_get(env, &StorageKey::Ext(ExtKey::MetadataBinding)) {
+                Some(binding) => binding,
+                None => return default_rate,
+            };
+
+        let cache_key = StorageKey::Ext(ExtKey::MetadataRateCache(
+            binding.collection_address.clone(),
+            token_id,
+        ));
+        let now = env.ledger().timestamp();
+
+        if let Some(cached) = storage::temporary_get::<MetadataRateCache>(env, &cache_key) {
+            let fresh = now.saturating_sub(cached.cached_at) < METADATA_CACHE_TTL_SECS;
+            if fresh && cached.metadata_oracle == binding.metadata_oracle {
+                return cached.rate_override.unwrap_or(default_rate);
+            }
+        }
+
+        let rate_override = match Self::query_metadata_oracle(env, &binding, token_id) {
+            Some(answer) => answer,
+            // Oracle unavailable: fall back without caching so the next sale retries.
+            None => {
+                env.events().publish(
+                    (symbol_short!("royalty"), symbol_short!("md_fail")),
+                    token_id,
+                );
+                return default_rate;
+            }
+        };
+
+        storage::temporary_set(
+            env,
+            &cache_key,
+            &MetadataRateCache {
+                metadata_oracle: binding.metadata_oracle,
+                rate_override,
+                cached_at: now,
+            },
+            storage::METADATA_CACHE_LEDGER_TTL,
+        );
+
+        if let Some(rate) = rate_override {
+            env.events().publish(
+                (symbol_short!("royalty"), symbol_short!("md_rate")),
+                (token_id, rate),
+            );
+        }
+        rate_override.unwrap_or(default_rate)
+    }
+
+    /// `Some(answer)` when the oracle responded (the answer itself may be "no
+    /// override"); `None` when it could not be reached or returned garbage.
+    /// Out-of-range rates are treated as "no override" rather than failures.
+    fn query_metadata_oracle(
+        env: &Env,
+        binding: &MetadataBinding,
+        token_id: u64,
+    ) -> Option<Option<u32>> {
+        let mut args: Vec<Val> = Vec::new(env);
+        args.push_back(binding.collection_address.clone().into_val(env));
+        args.push_back(token_id.into_val(env));
+        let answer = env
+            .try_invoke_contract::<Option<u32>, soroban_sdk::InvokeError>(
+                &binding.metadata_oracle,
+                &Symbol::new(env, "get_rate_override"),
+                args,
+            )
+            .ok()?
+            .ok()?;
+        Some(answer.filter(|rate| *rate <= 10_000))
     }
 
     pub fn get_royalty_rate(env: Env) -> u32 {
@@ -2205,7 +2640,8 @@ impl RoyaltySplitter {
             return Err(ContractError::Underfunded);
         }
 
-        let payouts = Self::calculate_payouts(&env, amount, &recipients)?;
+        let (forwards, local_amount) = Self::linked_forwards(&env, amount)?; // #932
+        let payouts = Self::local_payouts(&env, local_amount, &recipients)?;
         let recipient_count = recipients.len();
 
         // ── Checks-Effects-Interactions (CEI) Pattern ─────────────────────────
@@ -2228,6 +2664,7 @@ impl RoyaltySplitter {
             &current_count.saturating_add(1),
         );
 
+        Self::pay_linked_forwards(&env, &token_client, &token, &forwards);
         for (addr, payout) in payouts.iter() {
             token_client.transfer(&env.current_contract_address(), &addr, &payout);
             let total_earned = Self::record_recipient_earnings(&env, &addr, &token, payout)?;
