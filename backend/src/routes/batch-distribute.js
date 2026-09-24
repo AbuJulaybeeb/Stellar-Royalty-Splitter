@@ -3,7 +3,7 @@ import { addressToScVal, BatchTransactionBuilder } from "../stellar.js";
 import { validate, batchDistributeSchema, MAX_BATCH_OPERATIONS } from "../validation.js";
 import { recordTransaction, addAuditLog } from "../database/index.js";
 import { sendError } from "../error-response.js";
-import { invalidateContract } from "../cache.js";
+import { invalidateContractCaches } from "../cache-invalidation.js";
 import { recordTransactionFailure, recordTransactionSuccess } from "../metrics.js";
 import logger from "../logger.js";
 import { broadcastToContract } from "../websocket.js";
@@ -89,7 +89,7 @@ batchDistributeRouter.post(
             tokenId,
             batch: true,
           });
-          invalidateContract(contractId);
+          invalidateContractCaches(contractId, { reason: "batch-distribute" });
 
           // Broadcast distribution event for real-time updates
           broadcastToContract(contractId, {
@@ -178,7 +178,7 @@ batchDistributeRouter.post(
         tokens,
         idempotencyKey,
       });
-      invalidateContract(contractId);
+      invalidateContractCaches(contractId, { reason: "batch-distribute" });
 
       res.json({
         success: true,

@@ -11,7 +11,7 @@ import {
   recordTransactionSuccess,
 } from "../metrics.js";
 import { sendError } from "../error-response.js";
-import { invalidateContract } from "../cache.js";
+import { invalidateContractCaches } from "../cache-invalidation.js";
 import logger from "../logger.js";
 import { tieredLimiters } from "../middleware/tieredRateLimit.js";
 import { broadcastToContract } from "../websocket.js";
@@ -62,8 +62,9 @@ distributeRouter.post(
       recordDistributionLatency("build", Date.now() - buildStart);
       recordDistributionOutcomeMetric("built");
       // Invalidate cached history and contract state so the new distribution
-      // appears immediately on subsequent reads.
-      invalidateContract(contractId);
+      // appears immediately on subsequent reads. Propagates via Redis
+      // pub/sub to every other backend instance too (#926).
+      invalidateContractCaches(contractId, { reason: "distribute" });
 
       // Broadcast distribution event to connected WebSocket clients for real-time updates
       broadcastToContract(contractId, {

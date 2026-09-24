@@ -74,10 +74,15 @@ import { setSecondaryRoyaltyPoolSource } from "./metrics.js";
 import { httpMetricsMiddleware } from "./middleware/http-metrics.js";
 import { createTrafficShadowMiddleware } from "./middleware/traffic-shadow.js";
 import { getPendingRoyaltyPools } from "./database/secondary-royalties.js";
+import { initRedisCache } from "./cache.js";
 
 // Initialize database on startup
 initializeDatabase();
 initializeSigningKey();
+
+// Connect the distributed (Redis) cache layer when REDIS_URL is configured.
+// No-op when unset; never throws (#926).
+initRedisCache();
 
 // Keep the searchable log store bounded without requiring a separate worker.
 // `unref` means this maintenance timer cannot keep tests or graceful shutdowns alive.

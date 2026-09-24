@@ -4,7 +4,7 @@ import { server, networkPassphrase } from "../stellar.js";
 import logger from "../logger.js";
 import { validateContractIdMiddleware } from "../validation.js";
 import { sendError } from "../error-response.js";
-import { cacheGet, cacheSet, cacheKey, TTL } from "../cache.js";
+import { cacheGet, cacheSet, cacheKey, TTL, onCacheInvalidated } from "../cache.js";
 
 const { Address, Contract, SorobanRpc, TransactionBuilder, BASE_FEE, Account } = StellarSdk;
 export const collaboratorsRouter = Router();
@@ -75,6 +75,31 @@ setInterval(() => {
     if (!timers.has(key)) schedule(key, id);
   }
 }, 60000).unref();
+
+// Evict this module's local "stale" fallback value whenever a distribution
+// or admin action invalidates the cache (#926) — locally, or on another
+// backend instance via Redis pub/sub. Without this, the warm-window
+// stale-serving path in the GET handler below would keep returning
+// pre-invalidation data even after cache.js's own store was cleared.
+onCacheInvalidated((key, { prefix }) => {
+  if (prefix) {
+    for (const k of stale.keys()) {
+      if (k.startsWith(key)) {
+        stale.delete(k);
+        if (timers.has(k)) {
+          clearTimeout(timers.get(k));
+          timers.delete(k);
+        }
+      }
+    }
+  } else {
+    stale.delete(key);
+    if (timers.has(key)) {
+      clearTimeout(timers.get(key));
+      timers.delete(key);
+    }
+  }
+});
 
 collaboratorsRouter.get("/:contractId", validateContractIdMiddleware, async (req, res, next) => {
   try {
