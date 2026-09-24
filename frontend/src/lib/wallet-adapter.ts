@@ -1,5 +1,3 @@
-import { EventEmitter } from 'events';
-
 // Types for wallet interactions
 export interface WalletAdapter {
   name: string;
