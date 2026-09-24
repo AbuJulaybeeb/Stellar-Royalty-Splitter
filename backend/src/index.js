@@ -52,6 +52,7 @@ import { docsRouter } from "./routes/docs.js";
 import { tiersRouter } from "./routes/tiers.js";
 import { attachRole } from "./middleware/rbac.js";
 import { csvImportRouter } from "./routes/csv-import.js";
+import { quickbooksRouter } from "./routes/accounting/quickbooks.js";
 import { contributorTaxRouter } from "./routes/contributor-tax.js";
 import { notificationsRouter } from "./routes/notifications.js";
 import { paymentHoldsRouter } from "./routes/payment-holds.js";
@@ -279,7 +280,17 @@ app.use((req, _res, next) => {
 
 // Global max request body size — configurable via env, defaults to prior hardcoded value.
 const MAX_REQUEST_BODY_SIZE = process.env.MAX_REQUEST_BODY_SIZE ?? "10kb";
-app.use(express.json({ limit: MAX_REQUEST_BODY_SIZE }));
+// `verify` captures the raw request bytes before JSON parsing so signed
+// webhooks (QuickBooks `intuit-signature`, etc.) can recompute the HMAC over
+// the exact payload that was sent rather than a re-serialisation (#940).
+app.use(
+  express.json({
+    limit: MAX_REQUEST_BODY_SIZE,
+    verify: (req, _res, buf) => {
+      req.rawBody = buf;
+    },
+  })
+);
 
 // Attach X-API-Version header to all versioned responses
 app.use("/api/v1", (_req, res, next) => {
@@ -322,6 +333,7 @@ app.use("/api/v1/secondary-royalty", writeLimiter);
 app.use("/api/v1/webhooks", writeLimiter);
 app.use("/api/v1/onboarding", writeLimiter);
 app.use("/api/v1/simulate", simulateLimiter);
+app.use("/api/v1/accounting", writeLimiter);
 
 // Apply read limiter to high-fan-out query endpoints (#394 — MEDIUM-16)
 app.use("/api/v1/analytics", readLimiter);
@@ -372,6 +384,9 @@ app.use("/api/v1/docs", docsRouter);
 
 // CSV bulk import (#597)
 app.use("/api/v1/csv-import", csvImportRouter);
+
+// QuickBooks accounting sync (#940)
+app.use("/api/v1/accounting/quickbooks", quickbooksRouter);
 
 // Contributor tax information (#595)
 app.use("/api/v1/contributor-tax", contributorTaxRouter);
