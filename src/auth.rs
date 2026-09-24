@@ -56,6 +56,9 @@ pub mod msg {
         "set_emergency_pause_signers: admin authorization required";
     pub const EMERGENCY_PAUSE_SIGNER: &str =
         "emergency_pause: authorized emergency signer authorization required";
+    pub const SET_TOKEN_FEE_OVERRIDE_ADMIN: &str =
+        "set_token_fee_override: admin authorization required";
+    pub const WITHDRAW_FEES_ADMIN: &str = "withdraw_fees: admin authorization required";
 }
 
 /// Requires admin authorization; panics with `message` if missing.

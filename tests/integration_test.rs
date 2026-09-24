@@ -7186,3 +7186,212 @@ mod linked_pools {
         assert_eq!(shares.get(shared), Some(10_000));
     }
 }
+
+/// Issue #929 — dynamic per-token fee overrides and fee pool withdrawal.
+mod dynamic_fees {
+    use super::*;
+    use soroban_sdk::vec;
+
+    /// Initializes a 2-collaborator (60/40) splitter in `env`, mints `funding`
+    /// of a fresh token to it, and sets the default royalty rate to
+    /// `default_bps` (skipped when 0, since `set_royalty_rate` rejects 0).
+    /// Returns `(client, token, collaborator_a, collaborator_b)`.
+    fn fixture(
+        env: &Env,
+        default_bps: u32,
+        funding: i128,
+    ) -> (RoyaltySplitterClient<'_>, Address, Address, Address) {
+        env.mock_all_auths();
+        let (contract_id, client) = setup(env);
+        let a = Address::generate(env);
+        let b = Address::generate(env);
+        client.initialize(
+            &vec![env, a.clone(), b.clone()],
+            &vec![env, 6_000_u32, 4_000_u32],
+        );
+        if default_bps > 0 {
+            client.set_royalty_rate(&default_bps);
+        }
+        let token_admin = Address::generate(env);
+        let token = make_token(env, &token_admin);
+        if funding > 0 {
+            mint(env, &token, &contract_id, funding);
+        }
+        (client, token, a, b)
+    }
+
+    #[test]
+    fn no_override_and_no_default_rate_takes_no_fee() {
+        let env = Env::default();
+        let (client, token, a, b) = fixture(&env, 0, 10_000);
+        assert_eq!(client.get_token_fee_override(&token), None);
+
+        client.distribute(&token);
+
+        assert_eq!(client.get_fee_pool(&token), 0);
+        assert_eq!(TokenClient::new(&env, &token).balance(&a), 6_000);
+        assert_eq!(TokenClient::new(&env, &token).balance(&b), 4_000);
+    }
+
+    #[test]
+    fn distribute_falls_back_to_default_rate_when_no_override_set() {
+        // 10% default rate, no per-token override configured.
+        let env = Env::default();
+        let (client, token, a, b) = fixture(&env, 1_000, 10_000);
+
+        client.distribute(&token);
+
+        // 10% of 10_000 = 1_000 fee; 9_000 left split 60/40.
+        assert_eq!(client.get_fee_pool(&token), 1_000);
+        assert_eq!(TokenClient::new(&env, &token).balance(&a), 5_400);
+        assert_eq!(TokenClient::new(&env, &token).balance(&b), 3_600);
+    }
+
+    #[test]
+    fn token_override_replaces_default_rate() {
+        // Default rate is 10%, but this token has a 20% override.
+        let env = Env::default();
+        let (client, token, a, b) = fixture(&env, 1_000, 10_000);
+        client.set_token_fee_override(&token, &2_000);
+        assert_eq!(client.get_token_fee_override(&token), Some(2_000));
+
+        client.distribute(&token);
+
+        // 20% of 10_000 = 2_000 fee; 8_000 left split 60/40.
+        assert_eq!(client.get_fee_pool(&token), 2_000);
+        assert_eq!(TokenClient::new(&env, &token).balance(&a), 4_800);
+        assert_eq!(TokenClient::new(&env, &token).balance(&b), 3_200);
+    }
+
+    #[test]
+    fn override_is_per_token_other_tokens_keep_default_rate() {
+        let env = Env::default();
+        let (client, token_a, a, b) = fixture(&env, 1_000, 10_000);
+        client.set_token_fee_override(&token_a, &2_000);
+
+        // A second token with no override still uses the 10% default.
+        let token_b_admin = Address::generate(&env);
+        let token_b = make_token(&env, &token_b_admin);
+        mint(&env, &token_b, &client.address, 10_000);
+
+        client.distribute(&token_a);
+        client.distribute(&token_b);
+
+        assert_eq!(client.get_fee_pool(&token_a), 2_000); // 20%
+        assert_eq!(client.get_fee_pool(&token_b), 1_000); // 10% default
+        assert_eq!(TokenClient::new(&env, &token_a).balance(&a), 4_800);
+        assert_eq!(TokenClient::new(&env, &token_b).balance(&a), 5_400);
+        let _ = b;
+    }
+
+    #[test]
+    fn fee_pool_accumulates_across_multiple_distributions() {
+        // `distribute` pays out the whole current contract balance each
+        // call; the fee it carves off is left behind in that balance (not
+        // transferred out) until `withdraw_fees` moves it. So the second
+        // distribution's fee is computed on (leftover fee + freshly minted),
+        // not on the fresh mint alone.
+        let env = Env::default();
+        let (client, token, _a, _b) = fixture(&env, 1_000, 10_000);
+        client.distribute(&token); // fee = 10% of 10_000 = 1_000; pool = 1_000
+
+        mint(&env, &token, &client.address, 20_000);
+        // Contract balance is now 1_000 (leftover fee) + 20_000 = 21_000.
+        client.distribute(&token); // fee = 10% of 21_000 = 2_100; pool = 3_100
+
+        assert_eq!(client.get_fee_pool(&token), 3_100);
+    }
+
+    #[test]
+    fn set_token_fee_override_requires_admin_auth() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_, client) = setup(&env);
+        let admin = Address::generate(&env);
+        client.initialize(&vec![&env, admin.clone()], &vec![&env, 10_000_u32]);
+
+        let token = Address::generate(&env);
+        client.set_token_fee_override(&token, &500);
+        let auths = env.auths();
+        assert_eq!(auths.len(), 1);
+        assert_eq!(auths[0].0, admin);
+    }
+
+    #[test]
+    fn set_token_fee_override_rejects_out_of_range_bps() {
+        let env = Env::default();
+        let (client, token, _a, _b) = fixture(&env, 0, 0);
+        assert_eq!(
+            client.try_set_token_fee_override(&token, &10_001),
+            Err(Ok(ContractError::FEE_OVERRIDE_TOO_HIGH))
+        );
+    }
+
+    #[test]
+    fn withdraw_fees_transfers_pool_and_resets_it() {
+        let env = Env::default();
+        let (client, token, _a, _b) = fixture(&env, 1_000, 10_000);
+        client.distribute(&token); // fee pool now 1_000
+
+        let admin = client.get_admin();
+        let admin_balance_before = TokenClient::new(&env, &token).balance(&admin);
+
+        let withdrawn = client.withdraw_fees(&token);
+        assert_eq!(withdrawn, 1_000);
+        assert_eq!(client.get_fee_pool(&token), 0);
+        assert_eq!(
+            TokenClient::new(&env, &token).balance(&admin),
+            admin_balance_before + 1_000
+        );
+    }
+
+    #[test]
+    fn withdraw_fees_with_empty_pool_returns_error() {
+        let env = Env::default();
+        let (client, token, _a, _b) = fixture(&env, 0, 0);
+        assert_eq!(
+            client.try_withdraw_fees(&token),
+            Err(Ok(ContractError::NO_FEES_TO_WITHDRAW))
+        );
+    }
+
+    #[test]
+    fn withdraw_fees_requires_admin_auth() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_, client) = setup(&env);
+        let admin = Address::generate(&env);
+        client.initialize(&vec![&env, admin.clone()], &vec![&env, 10_000_u32]);
+        client.set_royalty_rate(&1_000);
+
+        let token_admin = Address::generate(&env);
+        let token = make_token(&env, &token_admin);
+        mint(&env, &token, &client.address, 10_000);
+        client.distribute(&token);
+
+        let auths_before = env.auths().len();
+        client.withdraw_fees(&token);
+        let auths = env.auths();
+        // withdraw_fees itself is the top-level authorized call in this batch.
+        assert!(auths.len() >= auths_before);
+        assert_eq!(auths.last().unwrap().0, admin);
+    }
+
+    #[test]
+    fn withdraw_fees_only_affects_the_named_token() {
+        let env = Env::default();
+        let (client, token_a, _a, _b) = fixture(&env, 1_000, 10_000);
+        client.set_token_fee_override(&token_a, &2_000);
+
+        let token_b_admin = Address::generate(&env);
+        let token_b = make_token(&env, &token_b_admin);
+        mint(&env, &token_b, &client.address, 10_000);
+
+        client.distribute(&token_a); // fee pool: 2_000
+        client.distribute(&token_b); // fee pool: 1_000
+
+        client.withdraw_fees(&token_a);
+        assert_eq!(client.get_fee_pool(&token_a), 0);
+        assert_eq!(client.get_fee_pool(&token_b), 1_000);
+    }
+}

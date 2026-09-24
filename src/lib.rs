@@ -274,6 +274,15 @@ pub enum ExtKey {
     MetadataRateCache(Address, u64),
     /// #932 — `Vec<LinkedPool>` (persistent storage).
     LinkedContracts,
+    /// #929 — per-token protocol fee override, basis points (instance storage).
+    /// Present only for tokens an admin has explicitly overridden; absent
+    /// means "use the default `RoyaltyRate`".
+    TokenFeeOverride(Address),
+    /// #929 — accumulated, not-yet-withdrawn protocol fee for one token, in
+    /// that token's smallest unit (persistent storage). Grows via
+    /// `saturating_add` on every `distribute`/`distribute_with_override`
+    /// call and is decremented by `withdraw_fees`.
+    FeePool(Address),
 }
 
 /// Maximum number of rate-change entries kept in history.
@@ -442,6 +451,10 @@ impl ContractError {
     pub const TOO_MANY_LINKED_POOLS: Self = Self::TooManyRecipients;
     /// `unlink_pool` for a source that is not linked.
     pub const POOL_NOT_LINKED: Self = Self::CollaboratorNotFound;
+    /// `set_token_fee_override` called with `override_bps > 10_000`.
+    pub const FEE_OVERRIDE_TOO_HIGH: Self = Self::RoyaltyRateTooHigh;
+    /// `withdraw_fees` for a token whose fee pool is zero.
+    pub const NO_FEES_TO_WITHDRAW: Self = Self::NoBalance;
 }
 
 #[contract]
@@ -1348,7 +1361,9 @@ impl RoyaltySplitter {
 
         let recipients_to_use = Self::resolve_recipients(&env, override_recipients)?;
         let (forwards, local_amount) = Self::linked_forwards(&env, amount)?; // #932
-        let payouts = Self::local_payouts(&env, local_amount, &recipients_to_use)?;
+        let (fee_amount, collaborator_amount) =
+            Self::carve_protocol_fee(&env, &token, local_amount)?; // #929
+        let payouts = Self::local_payouts(&env, collaborator_amount, &recipients_to_use)?;
         let recipient_count = recipients_to_use.len();
 
         // ── Checks-Effects-Interactions (CEI) Pattern ─────────────────────────
@@ -1377,6 +1392,15 @@ impl RoyaltySplitter {
             &StorageKey::DistributeHistory,
             &current_count.saturating_add(1),
         );
+
+        // #929 — accrue the carved-out protocol fee into that token's fee
+        // pool. The fee tokens themselves are simply left in the contract's
+        // balance (not transferred anywhere yet); `withdraw_fees` is what
+        // later moves them out. Bookkeeping only, so it belongs in the
+        // Effects phase alongside the other storage writes above.
+        if fee_amount > 0 {
+            Self::accrue_fee_pool(&env, &token, fee_amount);
+        }
 
         Self::pay_linked_forwards(&env, &token_client, &token, &forwards);
         for (addr, payout) in payouts.iter() {
@@ -1755,6 +1779,141 @@ impl RoyaltySplitter {
     pub fn distribute(env: Env, token: Address) -> Result<(), ContractError> {
         Self::distribute_with_override(env.clone(), token, Vec::new(&env))?;
         Ok(())
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // #929 — Dynamic per-token fee overrides and fee pool
+    //
+    // `distribute` / `distribute_with_override` carve a protocol fee out of
+    // the amount that would otherwise all go to collaborators, using
+    // `set_token_fee_override`'s rate for that token if one is set, else the
+    // contract's existing default `RoyaltyRate`. The carved amount accrues
+    // into a per-token `FeePool` (left in the contract's own balance) and is
+    // later moved out by `withdraw_fees`. This is intentionally separate
+    // from `SecondaryPool` (#the pre-existing secondary-royalty pool used by
+    // `record_secondary_royalty` / `distribute_secondary`): that pool holds
+    // funds collaborators still get paid from; `FeePool` holds funds that
+    // only the admin ever withdraws.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// The fee rate (basis points) that applies to `token` right now: its
+    /// override if one is set, else the default `RoyaltyRate` (0 if that is
+    /// unset too, matching every other rate read in this contract).
+    fn effective_fee_bps(env: &Env, token: &Address) -> u32 {
+        let key = StorageKey::Ext(ExtKey::TokenFeeOverride(token.clone()));
+        if let Some(bps) = storage::instance_get::<u32>(env, &key) {
+            return bps;
+        }
+        env.storage()
+            .instance()
+            .get(&StorageKey::RoyaltyRate)
+            .unwrap_or(0)
+    }
+
+    /// Splits `local_amount` into `(fee_amount, remaining_for_collaborators)`
+    /// using `effective_fee_bps`. Pure with respect to storage — the caller
+    /// decides when/whether to actually accrue `fee_amount` into the pool.
+    fn carve_protocol_fee(
+        env: &Env,
+        token: &Address,
+        local_amount: i128,
+    ) -> Result<(i128, i128), ContractError> {
+        let fee_bps = Self::effective_fee_bps(env, token);
+        if fee_bps == 0 {
+            return Ok((0, local_amount));
+        }
+        let fee_amount = Self::checked_bps_amount(env, local_amount, fee_bps)?;
+        let remaining = local_amount
+            .checked_sub(fee_amount)
+            .ok_or(ContractError::ArithmeticOverflow)?;
+        Ok((fee_amount, remaining))
+    }
+
+    /// Accrues `fee_amount` into `token`'s fee pool with overflow-safe
+    /// (`saturating_add`) arithmetic — per #929's acceptance criteria, fee
+    /// bookkeeping must never lose funds or panic on overflow. Saturating
+    /// (rather than `checked_add` + error) is deliberate here: this call
+    /// happens in the Effects phase of `distribute_with_override`, after
+    /// tokens have already been accounted for, so failing the whole
+    /// distribution over fee-pool bookkeeping overflowing at `i128::MAX`
+    /// (a practically unreachable balance) would be worse than saturating.
+    fn accrue_fee_pool(env: &Env, token: &Address, fee_amount: i128) {
+        let key = StorageKey::Ext(ExtKey::FeePool(token.clone()));
+        let current: i128 = storage::persistent_get::<i128>(env, &key).unwrap_or(0);
+        let new_total = current.saturating_add(fee_amount);
+        storage::persistent_set(env, &key, &new_total);
+        env.events().publish(
+            (symbol_short!("royalty"), symbol_short!("fee_acc")),
+            (token.clone(), fee_amount, new_total),
+        );
+    }
+
+    /// Admin: set (or clear, with `override_bps == 0`) the protocol fee rate
+    /// applied to `token` by `distribute`/`distribute_with_override`. When no
+    /// override is set for a token, the default `RoyaltyRate` is used.
+    pub fn set_token_fee_override(
+        env: Env,
+        token: Address,
+        override_bps: u32,
+    ) -> Result<(), ContractError> {
+        storage::extend_instance_ttl(&env);
+        Self::check_admin_auth(&env, auth::msg::SET_TOKEN_FEE_OVERRIDE_ADMIN);
+
+        if override_bps > 10_000 {
+            return Err(ContractError::FEE_OVERRIDE_TOO_HIGH);
+        }
+
+        let key = StorageKey::Ext(ExtKey::TokenFeeOverride(token.clone()));
+        storage::instance_set(&env, &key, &override_bps);
+        env.events().publish(
+            (symbol_short!("royalty"), symbol_short!("fee_ovr")),
+            (token, override_bps),
+        );
+        Ok(())
+    }
+
+    /// The fee override configured for `token`, if any (`None` means "use
+    /// the default rate").
+    pub fn get_token_fee_override(env: Env, token: Address) -> Option<u32> {
+        storage::extend_instance_ttl(&env);
+        storage::instance_get(&env, &StorageKey::Ext(ExtKey::TokenFeeOverride(token)))
+    }
+
+    /// Accumulated, not-yet-withdrawn protocol fee for `token`.
+    pub fn get_fee_pool(env: Env, token: Address) -> i128 {
+        storage::extend_instance_ttl(&env);
+        storage::persistent_get::<i128>(&env, &StorageKey::Ext(ExtKey::FeePool(token))).unwrap_or(0)
+    }
+
+    /// Admin: withdraw the accumulated fee pool for `token`, transferring the
+    /// full balance to the admin and resetting the pool to zero. Returns the
+    /// withdrawn amount. Errors (without moving any funds) if the pool is
+    /// empty.
+    pub fn withdraw_fees(env: Env, token: Address) -> Result<i128, ContractError> {
+        storage::extend_instance_ttl(&env);
+        Self::check_admin_auth(&env, auth::msg::WITHDRAW_FEES_ADMIN);
+
+        let key = StorageKey::Ext(ExtKey::FeePool(token.clone()));
+        let pool: i128 = storage::persistent_get::<i128>(&env, &key).unwrap_or(0);
+        if pool <= 0 {
+            return Err(ContractError::NO_FEES_TO_WITHDRAW);
+        }
+
+        let admin = Self::require_admin_address(&env)?;
+
+        // ── Checks-Effects-Interactions ─────────────────────────────────
+        // Zero the pool before transferring out, so a reentrant call (or a
+        // second concurrent withdrawal) cannot double-withdraw.
+        storage::persistent_set(&env, &key, &0_i128);
+
+        let token_client = token::Client::new(&env, &token);
+        token_client.transfer(&env.current_contract_address(), &admin, &pool);
+
+        env.events().publish(
+            (symbol_short!("royalty"), symbol_short!("fee_wd")),
+            (token, pool, admin),
+        );
+        Ok(pool)
     }
 
     pub fn batch_distribute(env: Env, tokens: Vec<Address>) -> Result<(), ContractError> {
