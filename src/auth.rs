@@ -59,6 +59,7 @@ pub mod msg {
     pub const SET_TOKEN_FEE_OVERRIDE_ADMIN: &str =
         "set_token_fee_override: admin authorization required";
     pub const WITHDRAW_FEES_ADMIN: &str = "withdraw_fees: admin authorization required";
+    pub const SET_ROYALTY_TIERS_ADMIN: &str = "set_royalty_tiers: admin authorization required";
 }
 
 /// Requires admin authorization; panics with `message` if missing.

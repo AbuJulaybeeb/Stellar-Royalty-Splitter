@@ -19,6 +19,21 @@ pub struct Recipient {
     pub share: u32,
 }
 
+/// One admin-configured royalty tier (#930). `rarity` is a short identifier
+/// (e.g. "legendary", "rare") matched exactly against the `rarity` argument
+/// passed to `record_tiered_secondary_sale`; `soroban_sdk::String` is used
+/// rather than `std::String` because `#[contracttype]` fields must be
+/// SDK-native types that can cross the host/guest boundary (the same
+/// convention `MigrationRecord::note` and `RoyaltyRateChange` already use
+/// elsewhere in this file).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoyaltyTier {
+    pub rarity: String,
+    pub rate_bps: u32,
+    pub description: String,
+}
+
 /// One entry in the royalty rate change history (#323).
 #[contracttype]
 #[derive(Clone)]
@@ -283,6 +298,14 @@ pub enum ExtKey {
     /// `saturating_add` on every `distribute`/`distribute_with_override`
     /// call and is decremented by `withdraw_fees`.
     FeePool(Address),
+    /// #930 — admin-defined royalty tiers (persistent storage), `Vec<RoyaltyTier>`.
+    RoyaltyTiers,
+    /// #930 — resale count for one (token, nft_id) pair (persistent storage).
+    ResaleCount(Address, u64),
+    /// #930 — first-seen ledger timestamp for one (token, nft_id) pair
+    /// (persistent storage). Written the first time `record_tiered_secondary_sale`
+    /// observes that NFT; used for the 90-day time-based degradation.
+    NftFirstSeen(Address, u64),
 }
 
 /// Maximum number of rate-change entries kept in history.
@@ -371,6 +394,44 @@ pub const MAX_EMERGENCY_PAUSE_SIGNERS: u32 = 10;
 /// Total collaborator share weight — proposals need a strict majority of this.
 pub const TOTAL_SHARE_WEIGHT: u32 = 10_000;
 
+/// Maximum number of royalty tiers an admin may configure (#930). Bounded for
+/// the same execution/storage-cost reasons as `MAX_COLLABORATORS`.
+pub const MAX_ROYALTY_TIERS: u32 = 20;
+
+/// Resale count at and above which the 2nd-tier (50%-of-tier-rate)
+/// degradation applies (#930's acceptance criteria: "2nd+ resale").
+pub const TIER_DEGRADE_RESALE_COUNT_2ND: u32 = 2;
+
+/// Resale count at and above which the steeper (25%-of-tier-rate)
+/// degradation applies (#930's acceptance criteria: "4th+ resale ... down to
+/// 25% of tier rate").
+pub const TIER_DEGRADE_RESALE_COUNT_4TH: u32 = 4;
+
+/// Basis-point multiplier applied to the tier rate on the 2nd/3rd resale
+/// (50% of the tier rate).
+pub const TIER_DEGRADE_BPS_2ND: u32 = 5_000;
+
+/// Basis-point multiplier applied to the tier rate on the 4th+ resale
+/// (25% of the tier rate, i.e. "reduces rate by 75%" per the acceptance
+/// criteria).
+pub const TIER_DEGRADE_BPS_4TH: u32 = 2_500;
+
+/// Age, in seconds, after which a further time-based degradation applies on
+/// top of the resale-count degradation (#930). 90 days.
+pub const TIER_TIME_DEGRADE_AGE_SECS: u64 = 7_776_000;
+
+/// Basis-point multiplier applied on top of the resale-count degradation once
+/// an NFT is older than `TIER_TIME_DEGRADE_AGE_SECS` (#930).
+///
+/// JUDGMENT CALL (documented per task instructions): the issue text does not
+/// specify an exact time-based percentage, only that "a sale occurs more than
+/// 90 days since the NFT's creation" should "apply a further time-based rate
+/// reduction". We apply another 50% reduction on top of whatever the
+/// resale-count degradation already produced (i.e. the two degradations
+/// compound multiplicatively, resale-count first, then time-based — see
+/// `Self::tiered_secondary_rate` for the exact order and a worked example).
+pub const TIER_TIME_DEGRADE_BPS: u32 = 5_000;
+
 /// Backward-compatible alias for integration tests and external references.
 pub type DataKey = StorageKey;
 
@@ -455,6 +516,13 @@ impl ContractError {
     pub const FEE_OVERRIDE_TOO_HIGH: Self = Self::RoyaltyRateTooHigh;
     /// `withdraw_fees` for a token whose fee pool is zero.
     pub const NO_FEES_TO_WITHDRAW: Self = Self::NoBalance;
+    /// `set_royalty_tiers` called with an empty list or more tiers than
+    /// `MAX_ROYALTY_TIERS`.
+    pub const INVALID_ROYALTY_TIERS: Self = Self::TooManyRecipients;
+    /// `set_royalty_tiers` entry with `rate_bps > 10_000`.
+    pub const TIER_RATE_TOO_HIGH: Self = Self::RoyaltyRateTooHigh;
+    /// A tiered secondary sale named a `rarity` that no configured tier matches.
+    pub const UNKNOWN_ROYALTY_TIER: Self = Self::CollaboratorNotFound;
 }
 
 #[contract]
@@ -2265,6 +2333,204 @@ impl RoyaltySplitter {
             .unwrap_or(0);
 
         Self::checked_bps_amount(&env, sale_price, rate)
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // #930 — Tiered royalty rates (rarity, resale count, NFT age)
+    //
+    // The pre-existing `record_secondary_sale(sale_price)` and
+    // `record_nft_secondary_sale(token_id, sale_price)` are pure rate
+    // calculators with no notion of "which NFT, tracked over time" — neither
+    // stores anything. Tiering needs per-(token, nft_id) state (a resale
+    // counter and a first-seen timestamp), so it lives in a new function,
+    // `record_tiered_secondary_sale`, following the same "add a new,
+    // more-specific entry point rather than changing an existing one's
+    // signature" precedent `record_nft_secondary_sale` itself already set
+    // when #933 needed a `token_id` that `record_secondary_sale` doesn't take.
+    //
+    // Rate resolution for a sale of `nft_id` under `rarity`:
+    //   1. Look up the tier matching `rarity` (admin-configured via
+    //      `set_royalty_tiers`) → `tier.rate_bps`. Errors if no such tier.
+    //   2. Increment (or initialize, first time this (token, nft_id) is
+    //      seen) the resale count and first-seen timestamp for `nft_id`.
+    //   3. Apply resale-count degradation to `tier.rate_bps`:
+    //        count == 1        → 100% of tier.rate_bps (full rate)
+    //        count in [2, 3]   → 50%  of tier.rate_bps
+    //        count >= 4        → 25%  of tier.rate_bps
+    //   4. If the NFT is older than `TIER_TIME_DEGRADE_AGE_SECS` (90 days)
+    //      at the time of this sale, apply a further `TIER_TIME_DEGRADE_BPS`
+    //      (50%) reduction ON TOP of step 3's result — i.e. the two
+    //      degradations COMPOUND MULTIPLICATIVELY, resale-count first, then
+    //      time-based. Worked example: tier rate 1000 bps, 5th resale
+    //      (>= 4 ⇒ 25%) of a 100-day-old NFT (> 90 days ⇒ further 50%):
+    //      1000 × 0.25 × 0.50 = 125 bps. This compounding order (rather than
+    //      additive, or time-first) is a judgment call documented here
+    //      because the issue text specifies the resale-count percentages
+    //      exactly but leaves both the time-based percentage and the
+    //      compounding order/model unspecified.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Admin: replace the full set of royalty tiers. Each tier's `rarity`
+    /// must be unique among the list (duplicates would make
+    /// `record_tiered_secondary_sale` resolve to whichever the list happens
+    /// to match first, which is not a well-defined contract to expose).
+    pub fn set_royalty_tiers(env: Env, tiers: Vec<RoyaltyTier>) -> Result<(), ContractError> {
+        storage::extend_instance_ttl(&env);
+        Self::check_admin_auth(&env, auth::msg::SET_ROYALTY_TIERS_ADMIN);
+
+        if tiers.is_empty() || tiers.len() > MAX_ROYALTY_TIERS {
+            return Err(ContractError::INVALID_ROYALTY_TIERS);
+        }
+        for i in 0..tiers.len() {
+            let tier = tiers.get(i).unwrap();
+            if tier.rate_bps > 10_000 {
+                return Err(ContractError::TIER_RATE_TOO_HIGH);
+            }
+            for j in (i + 1)..tiers.len() {
+                if tiers.get(j).unwrap().rarity == tier.rarity {
+                    return Err(ContractError::DuplicateRecipient);
+                }
+            }
+        }
+
+        storage::persistent_set(&env, &StorageKey::Ext(ExtKey::RoyaltyTiers), &tiers);
+        env.events().publish(
+            (symbol_short!("royalty"), symbol_short!("tiers")),
+            tiers.len(),
+        );
+        Ok(())
+    }
+
+    pub fn get_royalty_tiers(env: Env) -> Vec<RoyaltyTier> {
+        storage::extend_instance_ttl(&env);
+        storage::persistent_get(&env, &StorageKey::Ext(ExtKey::RoyaltyTiers))
+            .unwrap_or(Vec::new(&env))
+    }
+
+    fn find_tier(env: &Env, rarity: &String) -> Result<RoyaltyTier, ContractError> {
+        let tiers: Vec<RoyaltyTier> =
+            storage::persistent_get(env, &StorageKey::Ext(ExtKey::RoyaltyTiers))
+                .unwrap_or(Vec::new(env));
+        for i in 0..tiers.len() {
+            let tier = tiers.get(i).unwrap();
+            if &tier.rarity == rarity {
+                return Ok(tier);
+            }
+        }
+        Err(ContractError::UNKNOWN_ROYALTY_TIER)
+    }
+
+    /// Current resale count for `(token, nft_id)`. `0` if never sold through
+    /// `record_tiered_secondary_sale`.
+    pub fn get_resale_count(env: Env, token: Address, nft_id: u64) -> u32 {
+        storage::extend_instance_ttl(&env);
+        storage::persistent_get::<u32>(&env, &StorageKey::Ext(ExtKey::ResaleCount(token, nft_id)))
+            .unwrap_or(0)
+    }
+
+    /// Ledger timestamp `(token, nft_id)` was first seen by
+    /// `record_tiered_secondary_sale`, if ever.
+    pub fn get_nft_first_seen(env: Env, token: Address, nft_id: u64) -> Option<u64> {
+        storage::extend_instance_ttl(&env);
+        storage::persistent_get(&env, &StorageKey::Ext(ExtKey::NftFirstSeen(token, nft_id)))
+    }
+
+    /// Applies the resale-count degradation (step 3 of the module doc
+    /// comment above) to `tier_rate_bps` for the given post-increment
+    /// `resale_count`.
+    fn resale_degraded_rate(tier_rate_bps: u32, resale_count: u32) -> u32 {
+        if resale_count >= TIER_DEGRADE_RESALE_COUNT_4TH {
+            ((tier_rate_bps as u64) * (TIER_DEGRADE_BPS_4TH as u64) / 10_000) as u32
+        } else if resale_count >= TIER_DEGRADE_RESALE_COUNT_2ND {
+            ((tier_rate_bps as u64) * (TIER_DEGRADE_BPS_2ND as u64) / 10_000) as u32
+        } else {
+            tier_rate_bps
+        }
+    }
+
+    /// Applies the time-based degradation (step 4) on top of an
+    /// already-resale-degraded rate, if `nft_age_secs` exceeds the 90-day
+    /// threshold.
+    fn time_degraded_rate(resale_degraded_bps: u32, nft_age_secs: u64) -> u32 {
+        if nft_age_secs > TIER_TIME_DEGRADE_AGE_SECS {
+            ((resale_degraded_bps as u64) * (TIER_TIME_DEGRADE_BPS as u64) / 10_000) as u32
+        } else {
+            resale_degraded_bps
+        }
+    }
+
+    /// Royalty for a tiered secondary sale of `nft_id` (under collection
+    /// `token`) at `rarity`, applying resale-count and NFT-age degradation
+    /// as described above. Records the sale: increments the resale count
+    /// and, the first time this `(token, nft_id)` is seen, records its
+    /// first-seen timestamp (used for age-based degradation on later sales).
+    pub fn record_tiered_secondary_sale(
+        env: Env,
+        token: Address,
+        nft_id: u64,
+        rarity: String,
+        sale_price: i128,
+    ) -> Result<i128, ContractError> {
+        storage::extend_instance_ttl(&env);
+
+        if sale_price <= 0 {
+            return Err(ContractError::SalePriceNotPositive);
+        }
+
+        let tier = Self::find_tier(&env, &rarity)?;
+
+        let count_key = StorageKey::Ext(ExtKey::ResaleCount(token.clone(), nft_id));
+        let resale_count: u32 = storage::persistent_get::<u32>(&env, &count_key)
+            .unwrap_or(0)
+            .saturating_add(1);
+        storage::persistent_set(&env, &count_key, &resale_count);
+
+        let seen_key = StorageKey::Ext(ExtKey::NftFirstSeen(token, nft_id));
+        let now = env.ledger().timestamp();
+        let first_seen: u64 = match storage::persistent_get::<u64>(&env, &seen_key) {
+            Some(existing) => existing,
+            None => {
+                storage::persistent_set(&env, &seen_key, &now);
+                now
+            }
+        };
+
+        let resale_degraded = Self::resale_degraded_rate(tier.rate_bps, resale_count);
+        let nft_age_secs = now.saturating_sub(first_seen);
+        let effective_rate = Self::time_degraded_rate(resale_degraded, nft_age_secs);
+
+        env.events().publish(
+            (symbol_short!("royalty"), symbol_short!("tier_amt")),
+            (nft_id, resale_count, effective_rate),
+        );
+
+        Self::checked_bps_amount(&env, sale_price, effective_rate)
+    }
+
+    /// The rate `record_tiered_secondary_sale` would apply right now to a
+    /// sale of `nft_id` at `rarity`, WITHOUT recording anything — i.e. as if
+    /// this were the next sale, but purely a read. Since the real call
+    /// increments the resale count first, this previews using
+    /// `current_resale_count + 1`, matching what the next real call would
+    /// actually use.
+    pub fn get_tiered_royalty_rate(
+        env: Env,
+        token: Address,
+        nft_id: u64,
+        rarity: String,
+    ) -> Result<u32, ContractError> {
+        storage::extend_instance_ttl(&env);
+        let tier = Self::find_tier(&env, &rarity)?;
+
+        let resale_count =
+            Self::get_resale_count(env.clone(), token.clone(), nft_id).saturating_add(1);
+        let resale_degraded = Self::resale_degraded_rate(tier.rate_bps, resale_count);
+
+        let now = env.ledger().timestamp();
+        let first_seen = Self::get_nft_first_seen(env.clone(), token, nft_id).unwrap_or(now);
+        let nft_age_secs = now.saturating_sub(first_seen);
+
+        Ok(Self::time_degraded_rate(resale_degraded, nft_age_secs))
     }
 
     // ─────────────────────────────────────────────────────────────────────

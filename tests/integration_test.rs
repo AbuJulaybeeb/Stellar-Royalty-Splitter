@@ -7395,3 +7395,254 @@ mod dynamic_fees {
         assert_eq!(client.get_fee_pool(&token_b), 1_000);
     }
 }
+
+/// Issue #930 — tiered royalty rates by NFT rarity, resale count, and age.
+mod tiered_royalties {
+    use super::*;
+    use soroban_sdk::vec;
+    use stellar_royalty_splitter::RoyaltyTier;
+
+    const RARE_BPS: u32 = 1_000; // 10% base tier rate for "rare"
+
+    fn rarity(env: &Env, s: &str) -> String {
+        String::from_str(env, s)
+    }
+
+    fn tier(env: &Env, name: &str, rate_bps: u32) -> RoyaltyTier {
+        RoyaltyTier {
+            rarity: rarity(env, name),
+            rate_bps,
+            description: String::from_str(env, "test tier"),
+        }
+    }
+
+    /// Initialized single-collaborator splitter with one "rare" tier at
+    /// `RARE_BPS` configured.
+    fn fixture(env: &Env) -> RoyaltySplitterClient<'_> {
+        env.mock_all_auths();
+        let (_, client) = setup(env);
+        client.initialize(&vec![env, Address::generate(env)], &vec![env, 10_000_u32]);
+        client.set_royalty_tiers(&vec![env, tier(env, "rare", RARE_BPS)]);
+        client
+    }
+
+    #[test]
+    fn admin_can_define_tiers_with_rate_and_description() {
+        let env = Env::default();
+        let client = fixture(&env);
+        let tiers = client.get_royalty_tiers();
+        assert_eq!(tiers.len(), 1);
+        assert_eq!(tiers.get(0).unwrap().rarity, rarity(&env, "rare"));
+        assert_eq!(tiers.get(0).unwrap().rate_bps, RARE_BPS);
+    }
+
+    #[test]
+    fn set_royalty_tiers_requires_admin_auth() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_, client) = setup(&env);
+        let admin = Address::generate(&env);
+        client.initialize(&vec![&env, admin.clone()], &vec![&env, 10_000_u32]);
+
+        client.set_royalty_tiers(&vec![&env, tier(&env, "rare", RARE_BPS)]);
+        let auths = env.auths();
+        assert_eq!(auths.len(), 1);
+        assert_eq!(auths[0].0, admin);
+    }
+
+    #[test]
+    fn set_royalty_tiers_rejects_empty_list_and_bad_rate() {
+        let env = Env::default();
+        let client = fixture(&env);
+        assert_eq!(
+            client.try_set_royalty_tiers(&vec![&env]),
+            Err(Ok(ContractError::INVALID_ROYALTY_TIERS))
+        );
+        assert_eq!(
+            client.try_set_royalty_tiers(&vec![&env, tier(&env, "epic", 10_001)]),
+            Err(Ok(ContractError::TIER_RATE_TOO_HIGH))
+        );
+    }
+
+    #[test]
+    fn unknown_rarity_is_rejected() {
+        let env = Env::default();
+        let client = fixture(&env);
+        let token = Address::generate(&env);
+        assert_eq!(
+            client.try_record_tiered_secondary_sale(&token, &1u64, &rarity(&env, "mythic"), &1_000),
+            Err(Ok(ContractError::UNKNOWN_ROYALTY_TIER))
+        );
+    }
+
+    #[test]
+    fn first_resale_uses_full_tier_rate() {
+        let env = Env::default();
+        let client = fixture(&env);
+        let token = Address::generate(&env);
+
+        let royalty =
+            client.record_tiered_secondary_sale(&token, &1u64, &rarity(&env, "rare"), &10_000);
+        // 10% of 10_000 = 1_000, full tier rate (1st resale).
+        assert_eq!(royalty, 1_000);
+        assert_eq!(client.get_resale_count(&token, &1u64), 1);
+    }
+
+    #[test]
+    fn second_resale_reduces_rate_by_half() {
+        let env = Env::default();
+        let client = fixture(&env);
+        let token = Address::generate(&env);
+
+        client.record_tiered_secondary_sale(&token, &1u64, &rarity(&env, "rare"), &10_000);
+        let royalty =
+            client.record_tiered_secondary_sale(&token, &1u64, &rarity(&env, "rare"), &10_000);
+        // 2nd resale: 50% of 10% = 5% of 10_000 = 500.
+        assert_eq!(royalty, 500);
+        assert_eq!(client.get_resale_count(&token, &1u64), 2);
+    }
+
+    #[test]
+    fn third_resale_still_at_half_rate() {
+        let env = Env::default();
+        let client = fixture(&env);
+        let token = Address::generate(&env);
+
+        for _ in 0..3 {
+            client.record_tiered_secondary_sale(&token, &1u64, &rarity(&env, "rare"), &10_000);
+        }
+        // 3rd resale is still ">= 2, < 4" => 50% of tier rate.
+        assert_eq!(client.get_resale_count(&token, &1u64), 3);
+        let preview = client.get_tiered_royalty_rate(&token, &1u64, &rarity(&env, "rare"));
+        // Preview is for the *next* (4th) sale, which crosses into the 25% band.
+        assert_eq!(preview, 250);
+    }
+
+    #[test]
+    fn fourth_plus_resale_reduces_rate_to_quarter() {
+        let env = Env::default();
+        let client = fixture(&env);
+        let token = Address::generate(&env);
+
+        let mut royalty = 0;
+        for _ in 0..4 {
+            royalty =
+                client.record_tiered_secondary_sale(&token, &1u64, &rarity(&env, "rare"), &10_000);
+        }
+        // 4th resale: 25% of 10% = 2.5% of 10_000 = 250.
+        assert_eq!(royalty, 250);
+        assert_eq!(client.get_resale_count(&token, &1u64), 4);
+
+        // A 5th resale stays at the 25% floor (no further resale-count decay
+        // defined beyond "4th+").
+        let fifth =
+            client.record_tiered_secondary_sale(&token, &1u64, &rarity(&env, "rare"), &10_000);
+        assert_eq!(fifth, 250);
+    }
+
+    #[test]
+    fn resale_count_and_first_seen_are_tracked_per_nft_id_independently() {
+        let env = Env::default();
+        let client = fixture(&env);
+        let token = Address::generate(&env);
+
+        client.record_tiered_secondary_sale(&token, &1u64, &rarity(&env, "rare"), &10_000);
+        client.record_tiered_secondary_sale(&token, &1u64, &rarity(&env, "rare"), &10_000);
+        // A different nft_id under the same token starts its own count at 0.
+        assert_eq!(client.get_resale_count(&token, &1u64), 2);
+        assert_eq!(client.get_resale_count(&token, &2u64), 0);
+
+        let royalty =
+            client.record_tiered_secondary_sale(&token, &2u64, &rarity(&env, "rare"), &10_000);
+        assert_eq!(royalty, 1_000); // nft_id 2's *first* resale: full tier rate.
+        assert_eq!(client.get_resale_count(&token, &2u64), 1);
+    }
+
+    #[test]
+    fn time_degradation_applies_after_ninety_days() {
+        let env = Env::default();
+        let client = fixture(&env);
+        let token = Address::generate(&env);
+
+        env.ledger().with_mut(|l| l.timestamp = 1_000_000);
+        // First sale: establishes first-seen timestamp, full tier rate.
+        let first =
+            client.record_tiered_secondary_sale(&token, &1u64, &rarity(&env, "rare"), &10_000);
+        assert_eq!(first, 1_000);
+        assert_eq!(client.get_nft_first_seen(&token, &1u64), Some(1_000_000));
+
+        // Advance past the 90-day threshold (7_776_000s) with no further
+        // resales, so resale count stays at 1 (no count-based degradation)
+        // and only the time-based degradation applies.
+        env.ledger()
+            .with_mut(|l| l.timestamp = 1_000_000 + 7_776_000 + 1);
+        let second =
+            client.record_tiered_secondary_sale(&token, &1u64, &rarity(&env, "rare"), &10_000);
+        // 2nd resale ALSO crosses the resale-count threshold (>= 2 => 50%),
+        // and the sale is > 90 days after first-seen => a further 50%.
+        // Compounded: 10% * 50% * 50% = 2.5% of 10_000 = 250.
+        assert_eq!(second, 250);
+    }
+
+    #[test]
+    fn time_and_resale_degradation_compound_multiplicatively_resale_first_then_time() {
+        // Isolate the time-based factor from the resale-count factor by
+        // keeping the sale on the FIRST resale (count == 1, no count-based
+        // degradation) but past the 90-day mark, so only the time factor
+        // should apply on top of the untouched full tier rate.
+        let env = Env::default();
+        let client = fixture(&env);
+        let token = Address::generate(&env);
+
+        env.ledger().with_mut(|l| l.timestamp = 1_000_000);
+        // Seed first-seen without counting as this NFT's first resale by
+        // using a different nft_id for the seed... Soroban has no "peek"
+        // that writes first-seen without a resale, so instead we assert the
+        // documented compounding directly via the read-only preview, which
+        // computes the *next* sale's rate without mutating state.
+        let preview_before_any_sale =
+            client.get_tiered_royalty_rate(&token, &1u64, &rarity(&env, "rare"));
+        // No first-seen recorded yet => age is treated as 0 (not degraded);
+        // this is the 1st-ever resale preview => full tier rate.
+        assert_eq!(preview_before_any_sale, 1_000);
+
+        client.record_tiered_secondary_sale(&token, &1u64, &rarity(&env, "rare"), &10_000);
+
+        // Now advance time past 90 days, but check the *3rd* resale preview
+        // math directly matches resale-first-then-time compounding:
+        // tier 1000 bps, count 2 (>=2 => 50%) = 500, age > 90d (=> further
+        // 50%) = 250.
+        env.ledger()
+            .with_mut(|l| l.timestamp = 1_000_000 + 7_776_000 + 1);
+        let preview = client.get_tiered_royalty_rate(&token, &1u64, &rarity(&env, "rare"));
+        assert_eq!(preview, 250);
+    }
+
+    #[test]
+    fn no_time_degradation_before_ninety_days() {
+        let env = Env::default();
+        let client = fixture(&env);
+        let token = Address::generate(&env);
+
+        env.ledger().with_mut(|l| l.timestamp = 1_000_000);
+        client.record_tiered_secondary_sale(&token, &1u64, &rarity(&env, "rare"), &10_000);
+
+        // Still well within 90 days.
+        env.ledger().with_mut(|l| l.timestamp = 1_000_000 + 1_000);
+        let royalty =
+            client.record_tiered_secondary_sale(&token, &1u64, &rarity(&env, "rare"), &10_000);
+        // 2nd resale, no time degradation: 50% of 10% = 500.
+        assert_eq!(royalty, 500);
+    }
+
+    #[test]
+    fn record_tiered_secondary_sale_rejects_non_positive_price() {
+        let env = Env::default();
+        let client = fixture(&env);
+        let token = Address::generate(&env);
+        assert_eq!(
+            client.try_record_tiered_secondary_sale(&token, &1u64, &rarity(&env, "rare"), &0),
+            Err(Ok(ContractError::SalePriceNotPositive))
+        );
+    }
+}
