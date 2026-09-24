@@ -76,10 +76,15 @@ import { setSecondaryRoyaltyPoolSource } from "./metrics.js";
 import { httpMetricsMiddleware } from "./middleware/http-metrics.js";
 import { createTrafficShadowMiddleware } from "./middleware/traffic-shadow.js";
 import { getPendingRoyaltyPools } from "./database/secondary-royalties.js";
+import { initRedisCache } from "./cache.js";
 
 // Initialize database on startup
 initializeDatabase();
 initializeSigningKey();
+
+// Connect the distributed (Redis) cache layer when REDIS_URL is configured.
+// No-op when unset; never throws (#926).
+initRedisCache();
 
 // Keep the searchable log store bounded without requiring a separate worker.
 // `unref` means this maintenance timer cannot keep tests or graceful shutdowns alive.
@@ -281,15 +286,16 @@ app.use((req, _res, next) => {
 
 // Global max request body size — configurable via env, defaults to prior hardcoded value.
 const MAX_REQUEST_BODY_SIZE = process.env.MAX_REQUEST_BODY_SIZE ?? "10kb";
+// `verify` stashes the raw request bytes on every request (cheap — the
+// buffer is already in memory from parsing). Routes that need to verify an
+// HMAC signature over the exact bytes the sender signed (e.g.
+// routes/marketplaces/opensea.js) read req.rawBody instead of re-serializing
+// req.body, which would not byte-for-byte match the original payload.
 app.use(
   express.json({
     limit: MAX_REQUEST_BODY_SIZE,
-    // #939: retain the exact bytes of Salesforce webhook requests so their
-    // HMAC-SHA256 signature can be verified after JSON parsing.
     verify: (req, _res, buf) => {
-      if (req.originalUrl?.startsWith("/api/v1/crm/salesforce/webhook")) {
-        req.rawBody = buf;
-      }
+      req.rawBody = buf.toString("utf8");
     },
   })
 );
@@ -396,8 +402,8 @@ app.use("/api/v1/contributor-tax", contributorTaxRouter);
 // Real-time notifications (#594)
 app.use("/api/v1/notifications", notificationsRouter);
 
-// Salesforce CRM bidirectional sync (#939)
-app.use("/api/v1/crm/salesforce", salesforceRouter);
+// SMS notification preferences (#927)
+app.use("/api/v1/notifications/sms", smsPreferencesRouter);
 
 // Payment hold/release system (#596)
 app.use("/api/v1/payment-holds", writeLimiter);
@@ -417,6 +423,10 @@ app.use("/api/v1/version", versionRouter);
 
 // Transaction finality tracking (#finality)
 app.use("/api/v1/transactions", transactionFinalityRouter);
+
+// OpenSea marketplace webhook integration (#928)
+app.use("/api/v1/marketplaces/opensea", writeLimiter);
+app.use("/api/v1/marketplaces/opensea", openseaRouter);
 
 // Admin operations (separate from /api/v1; protected by ADMIN_ROTATE_TOKEN)
 const RATE_LIMIT_ADMIN_WINDOW_MS = 60_000;

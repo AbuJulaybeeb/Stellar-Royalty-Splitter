@@ -39,6 +39,7 @@ import {
   disputeSubmittedEmail,
   disputeStatusUpdateEmail,
 } from "../email/templates/dispute-notification.js";
+import { sendEventSms } from "../services/sms-notifications.js";
 
 export const disputesRouter = Router();
 
@@ -120,6 +121,10 @@ disputesRouter.post("/", validate(disputeSubmitSchema), async (req, res, next) =
         })
       );
     }
+
+    // SMS confirmation (#927) — no-op unless the wallet has opted in with a
+    // phone number on file; never throws.
+    await sendEventSms(walletAddress, "dispute_opened", { ticketId: dispute.ticketId });
 
     return res.status(201).json({ success: true, data: dispute });
   } catch (err) {

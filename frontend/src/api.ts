@@ -130,6 +130,14 @@ async function get<T>(path: string): Promise<T> {
   return request<T>(path);
 }
 
+async function put<T>(path: string, body: unknown): Promise<T> {
+  return request<T>(path, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
 async function del<T>(path: string): Promise<T> {
   return request<T>(path, { method: "DELETE" });
 }
@@ -642,7 +650,81 @@ export const api = {
   getTaxComplianceReport: () => get<any>("/v1/contributor-tax/report"),
 
   getContributorsMissingTaxInfo: () => get<any>("/v1/contributor-tax/missing"),
+
+  // Contributor Tier APIs (#589) — used by CollaboratorTable and the
+  // Collaborator Directory (#923) to read/assign VIP/regular/trial tiers.
+  getContractTiers: (contractId: string) =>
+    get<{ success: boolean; data: ContributorTier[]; validTiers: string[] }>(
+      `/tiers/${contractId}`,
+    ),
+
+  setContributorTier: (
+    contractId: string,
+    address: string,
+    tier: "vip" | "regular" | "trial",
+    notes?: string,
+  ) =>
+    put<{ success: boolean; message: string }>(
+      `/tiers/${contractId}/${address}`,
+      { tier, notes: notes ?? null },
+    ),
+
+  // Contributor Suspension / Deactivation APIs (#593) — read by
+  // ContributorSuspension.tsx and the Collaborator Directory's bulk
+  // suspend/unsuspend action (#923).
+  getContributorStatuses: (contractId: string, includeActive = false) =>
+    get<{ success: boolean; data: ContributorStatusEntry[] }>(
+      `/contributor-status/${contractId}?includeActive=${includeActive}`,
+    ),
+
+  setContributorStatus: (
+    contractId: string,
+    address: string,
+    body: {
+      status: "active" | "suspended" | "deactivated";
+      reason?: string;
+      updatedBy?: string;
+    },
+  ) =>
+    post<{ success: boolean; message?: string }>(
+      `/contributor-status/${contractId}/${address}`,
+      body,
+    ),
+
+  // Notification send API (#927) — reused by the Collaborator Directory's
+  // bulk "send message" action (#923) to message selected collaborators.
+  sendNotification: (
+    walletAddress: string,
+    type: string,
+    title: string,
+    message?: string,
+    data?: Record<string, unknown>,
+  ) =>
+    post<{ success: boolean; data: unknown }>("/v1/notifications/send", {
+      walletAddress,
+      type,
+      title,
+      message,
+      data,
+    }),
 };
+
+export interface ContributorTier {
+  walletAddress: string;
+  tier: "vip" | "regular" | "trial";
+  notes?: string | null;
+}
+
+export interface ContributorStatusEntry {
+  contractId: string;
+  address: string;
+  status: "active" | "suspended" | "deactivated";
+  reason: string | null;
+  suspendedAt: string | null;
+  deactivatedAt: string | null;
+  updatedBy: string | null;
+  updatedAt?: string;
+}
 
 export interface OnboardingItem {
   id: string;

@@ -11,7 +11,7 @@ import {
 } from "../stellar.js";
 import { validateContractIdMiddleware, validateContractId } from "../validation.js";
 import { sendError } from "../error-response.js";
-import { cacheGet, cacheSet, cacheKey, TTL, clearCache } from "../cache.js";
+import { cacheGet, cacheSet, cacheKey, TTL, clearCache, onCacheInvalidated } from "../cache.js";
 
 const { Contract, SorobanRpc, TransactionBuilder, BASE_FEE, Account } = StellarSdk;
 
@@ -261,6 +261,26 @@ export function _resetContractStateCache() {
   clearCache();
   cacheMetadata.clear();
 }
+
+// Evict this module's local warm-cache metadata (which holds the last-known
+// staleValue served during the warm window) whenever a distribution or
+// admin action invalidates the cache (#926) — locally, or on another
+// backend instance via Redis pub/sub.
+onCacheInvalidated((key, { prefix }) => {
+  if (prefix) {
+    for (const k of cacheMetadata.keys()) {
+      if (k.startsWith(key)) {
+        const meta = cacheMetadata.get(k);
+        if (meta?.timer) clearTimeout(meta.timer);
+        cacheMetadata.delete(k);
+      }
+    }
+  } else {
+    const meta = cacheMetadata.get(key);
+    if (meta?.timer) clearTimeout(meta.timer);
+    cacheMetadata.delete(key);
+  }
+});
 
 contractRouter.get("/state", async (req, res, next) => {
   try {
