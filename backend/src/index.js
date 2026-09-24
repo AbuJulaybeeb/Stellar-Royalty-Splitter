@@ -54,6 +54,7 @@ import { attachRole } from "./middleware/rbac.js";
 import { csvImportRouter } from "./routes/csv-import.js";
 import { contributorTaxRouter } from "./routes/contributor-tax.js";
 import { notificationsRouter } from "./routes/notifications.js";
+import { smsPreferencesRouter } from "./routes/notifications/sms.js";
 import { paymentHoldsRouter } from "./routes/payment-holds.js";
 import { earningsHistoryRouter } from "./routes/earnings-history.js";
 import { versionRouter } from "./routes/version.js";
@@ -383,6 +384,9 @@ app.use("/api/v1/contributor-tax", contributorTaxRouter);
 
 // Real-time notifications (#594)
 app.use("/api/v1/notifications", notificationsRouter);
+
+// SMS notification preferences (#927)
+app.use("/api/v1/notifications/sms", smsPreferencesRouter);
 
 // Payment hold/release system (#596)
 app.use("/api/v1/payment-holds", writeLimiter);

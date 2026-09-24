@@ -11,8 +11,20 @@ import {
   createSystemNotification,
 } from "../database/notifications.js";
 import { sendNotification } from "../websocket.js";
+import { sendEventSms } from "../services/sms-notifications.js";
 
 export const notificationsRouter = Router();
+
+// Event types this generic /send endpoint also fans out to SMS for (#927),
+// mapped to the params each SMS template builder expects. large_payout and
+// payment_failed have no dedicated trigger route of their own yet — this is
+// the closest existing generic hook point, matching how these events
+// already flow through createSystemNotification for in-app/websocket.
+const SMS_EVENT_PARAM_KEYS = {
+  large_payout: ["amount", "contractId"],
+  dispute_opened: ["ticketId"],
+  payment_failed: ["contractId", "reason"],
+};
 
 notificationsRouter.get("/:walletAddress", (req, res) => {
   try {
@@ -62,7 +74,7 @@ notificationsRouter.delete("/:id", (req, res) => {
   }
 });
 
-notificationsRouter.post("/send", (req, res) => {
+notificationsRouter.post("/send", async (req, res) => {
   try {
     const { walletAddress, type, title, message, data } = req.body;
     if (!walletAddress || !type || !title) {
@@ -70,6 +82,18 @@ notificationsRouter.post("/send", (req, res) => {
     }
     const notification = createSystemNotification(walletAddress, type, title, message, data);
     sendNotification(walletAddress, notification);
+
+    // Fan out to SMS for the event types that have an SMS template (#927).
+    // Best-effort: never blocks or fails the response — opt-in/phone-number
+    // checks happen inside sendEventSms.
+    const paramKeys = SMS_EVENT_PARAM_KEYS[type];
+    if (paramKeys) {
+      const templateParams = Object.fromEntries(
+        paramKeys.map((key) => [key, data?.[key]])
+      );
+      await sendEventSms(walletAddress, type, templateParams);
+    }
+
     res.json({ success: true, data: notification });
   } catch (err) {
     sendError(res, 500, "send_error", err.message);

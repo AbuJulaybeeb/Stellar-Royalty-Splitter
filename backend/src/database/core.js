@@ -328,6 +328,33 @@ export function initializeDatabase() {
           CREATE INDEX IF NOT EXISTS idx_application_logs_request_id ON application_logs(request_id);
         `,
     },
+    {
+      // #927: Twilio SMS notification channel — opt-in preferences + send log
+      version: 15,
+      sql: `
+          CREATE TABLE IF NOT EXISTS sms_preferences (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            walletAddress TEXT NOT NULL UNIQUE,
+            smsEnabled INTEGER NOT NULL DEFAULT 0,
+            phoneNumber TEXT,
+            updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP
+          );
+          CREATE INDEX IF NOT EXISTS idx_sms_preferences_wallet ON sms_preferences(walletAddress);
+
+          CREATE TABLE IF NOT EXISTS sms_send_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            walletAddress TEXT NOT NULL,
+            eventType TEXT NOT NULL,
+            phoneNumber TEXT NOT NULL,
+            status TEXT NOT NULL,
+            providerSid TEXT,
+            failureReason TEXT,
+            createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
+          );
+          CREATE INDEX IF NOT EXISTS idx_sms_send_log_wallet ON sms_send_log(walletAddress);
+          CREATE INDEX IF NOT EXISTS idx_sms_send_log_created_at ON sms_send_log(createdAt);
+        `,
+    },
   ];
 
   for (const migration of migrations) {
