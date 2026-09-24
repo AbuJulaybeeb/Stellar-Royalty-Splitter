@@ -65,8 +65,24 @@ export default function App() {
   const { connected: wsConnected } = useWebSocket({
     walletAddress,
     onNotification: (data: any) => {
+      const notificationTypes = [
+        "pending",
+        "confirmed",
+        "failed",
+        "info",
+        "distribution",
+        "payment",
+        "dispute",
+        "system",
+        "warning",
+      ] as const;
+
+      const notificationType = notificationTypes.includes(data.type)
+        ? data.type
+        : "info";
+
       addNotification({
-        type: data.type === "pending" || data.type === "confirmed" || data.type === "failed" ? data.type : "info",
+        type: notificationType,
         title: data.title || "Notification",
         message: data.message || "",
         txHash: data.txHash,

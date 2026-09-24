@@ -1,10 +1,26 @@
-import { createContext, useContext, useState, useCallback, useEffect, ReactNode } from "react";
+import {
+  createContext,
+  useContext,
+  useState,
+  useCallback,
+  useEffect,
+  ReactNode,
+} from "react";
 import { toast, ToastOptions } from "react-toastify";
 import "react-toastify/dist/ReactToastify.css";
 
 export interface Notification {
   id: string;
-  type: "pending" | "confirmed" | "failed" | "info";
+  type:
+    | "pending"
+    | "confirmed"
+    | "failed"
+    | "info"
+    | "distribution"
+    | "payment"
+    | "dispute"
+    | "system"
+    | "warning";
   title: string;
   message: string;
   timestamp: number;
@@ -15,7 +31,9 @@ export interface Notification {
 
 interface NotificationContextType {
   notifications: Notification[];
-  addNotification: (notification: Omit<Notification, "id" | "timestamp" | "read">) => void;
+  addNotification: (
+    notification: Omit<Notification, "id" | "timestamp" | "read">,
+  ) => void;
   markAsRead: (id: string) => void;
   markAllAsRead: () => void;
   clearNotification: (id: string) => void;
@@ -23,10 +41,12 @@ interface NotificationContextType {
   unreadCount: number;
 }
 
-const NotificationContext = createContext<NotificationContextType | undefined>(undefined);
+const NotificationContext = createContext<NotificationContextType | undefined>(
+  undefined,
+);
 
 const STORAGE_KEY = "srs_notification_history";
-const MAX_HISTORY = 100;
+const MAX_HISTORY = 50;
 
 function loadHistory(): Notification[] {
   try {
@@ -42,7 +62,10 @@ function loadHistory(): Notification[] {
 
 function saveHistory(notifications: Notification[]) {
   try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(notifications.slice(-MAX_HISTORY)));
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify(notifications.slice(-MAX_HISTORY)),
+    );
   } catch {
     // ignore
   }
@@ -60,52 +83,66 @@ const defaultToastOptions: ToastOptions = {
 };
 
 export function NotificationProvider({ children }: { children: ReactNode }) {
-  const [notifications, setNotifications] = useState<Notification[]>(() => loadHistory());
+  const [notifications, setNotifications] = useState<Notification[]>(() =>
+    loadHistory(),
+  );
 
   useEffect(() => {
     saveHistory(notifications);
   }, [notifications]);
 
-  const addNotification = useCallback((
-    notification: Omit<Notification, "id" | "timestamp" | "read">
-  ) => {
-    const id = `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-    const newNotification: Notification = {
-      ...notification,
-      id,
-      timestamp: Date.now(),
-      read: false,
-    };
+  const addNotification = useCallback(
+    (notification: Omit<Notification, "id" | "timestamp" | "read">) => {
+      const id = `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+      const newNotification: Notification = {
+        ...notification,
+        id,
+        timestamp: Date.now(),
+        read: false,
+      };
 
-    setNotifications((prev) => [newNotification, ...prev].slice(0, MAX_HISTORY));
+      setNotifications((prev) =>
+        [newNotification, ...prev].slice(0, MAX_HISTORY),
+      );
 
-    const toastOptions: ToastOptions = {
-      ...defaultToastOptions,
-      onClose: () => {
-        setNotifications((prev) =>
-          prev.map((n) => (n.id === id ? { ...n, read: true } : n))
-        );
-      },
-    };
+      const toastOptions: ToastOptions = {
+        ...defaultToastOptions,
+        onClose: () => {
+          setNotifications((prev) =>
+            prev.map((n) => (n.id === id ? { ...n, read: true } : n)),
+          );
+        },
+      };
 
-    switch (notification.type) {
-      case "pending":
-        toast.info(`⏳ ${notification.title}: ${notification.message}`, toastOptions);
-        break;
-      case "confirmed":
-        toast.success(`✅ ${notification.title}: ${notification.message}`, toastOptions);
-        break;
-      case "failed":
-        toast.error(`❌ ${notification.title}: ${notification.message}`, toastOptions);
-        break;
-      default:
-        toast(notification.message, { ...toastOptions, type: "default" });
-    }
-  }, []);
+      switch (notification.type) {
+        case "pending":
+          toast.info(
+            `⏳ ${notification.title}: ${notification.message}`,
+            toastOptions,
+          );
+          break;
+        case "confirmed":
+          toast.success(
+            `✅ ${notification.title}: ${notification.message}`,
+            toastOptions,
+          );
+          break;
+        case "failed":
+          toast.error(
+            `❌ ${notification.title}: ${notification.message}`,
+            toastOptions,
+          );
+          break;
+        default:
+          toast(notification.message, { ...toastOptions, type: "default" });
+      }
+    },
+    [],
+  );
 
   const markAsRead = useCallback((id: string) => {
     setNotifications((prev) =>
-      prev.map((n) => (n.id === id ? { ...n, read: true } : n))
+      prev.map((n) => (n.id === id ? { ...n, read: true } : n)),
     );
   }, []);
 
@@ -118,7 +155,9 @@ export function NotificationProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const clearAllNotifications = useCallback(() => {
-    setNotifications([]);
+    setNotifications((prev) =>
+      prev.filter((notification) => !notification.read),
+    );
   }, []);
 
   const unreadCount = notifications.filter((n) => !n.read).length;
@@ -143,7 +182,9 @@ export function NotificationProvider({ children }: { children: ReactNode }) {
 export function useNotifications() {
   const context = useContext(NotificationContext);
   if (!context) {
-    throw new Error("useNotifications must be used within a NotificationProvider");
+    throw new Error(
+      "useNotifications must be used within a NotificationProvider",
+    );
   }
   return context;
 }

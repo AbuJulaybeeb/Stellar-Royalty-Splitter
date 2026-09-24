@@ -28,14 +28,21 @@ export const Navigation: React.FC<NavigationProps> = ({
   const toggleTheme = useUIStore((s) => s.toggleTheme);
   const { network, setNetwork } = useNetwork();
 
-  // Close mobile menu on Escape and prevent body scroll while open
+  // Close mobile drawer on Escape and lock body scroll while open (#920).
+  // The drawer overlays the page on small screens, so background content
+  // must not scroll underneath it.
   useEffect(() => {
     if (!isMobileMenuOpen) return;
     function handleKeyDown(e: KeyboardEvent) {
       if (e.key === "Escape") setIsMobileMenuOpen(false);
     }
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
     document.addEventListener("keydown", handleKeyDown);
-    return () => document.removeEventListener("keydown", handleKeyDown);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      document.removeEventListener("keydown", handleKeyDown);
+    };
   }, [isMobileMenuOpen]);
 
   const navItems = [
@@ -98,6 +105,17 @@ export const Navigation: React.FC<NavigationProps> = ({
         >
           {isMobileMenuOpen ? "✕" : "☰"}
         </button>
+
+        {/* #920 — slide-in drawer: backdrop click closes, drawer slides in
+            from the left on small screens (CSS media queries). On desktop
+            widths this renders inline as before and the backdrop is hidden. */}
+        {isMobileMenuOpen && (
+          <div
+            className="nav-drawer-backdrop"
+            aria-hidden="true"
+            onClick={() => setIsMobileMenuOpen(false)}
+          />
+        )}
 
          <ul
           id="mobile-nav-links"

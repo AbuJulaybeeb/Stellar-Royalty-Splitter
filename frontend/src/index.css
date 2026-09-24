@@ -95,6 +95,34 @@ button:disabled {
   cursor: not-allowed;
 }
 
+/* #920 — 48px minimum touch targets on coarse pointers (phones/tablets).
+   Desktop pointer interactions are unaffected. */
+@media (pointer: coarse) {
+  button,
+  select,
+  input[type="checkbox"],
+  input[type="radio"] {
+    min-height: 48px;
+  }
+
+  button,
+  select {
+    min-width: 48px;
+  }
+
+  /* Small icon-only controls get padding instead of width so inline text
+     buttons (chips, links inside text) are not visually inflated. */
+  .copy-btn-sm,
+  .collab-search-clear,
+  .collab-filter-chip-remove,
+  .session-toast-close,
+  .wallet-disconnect-btn,
+  .clear-search-btn {
+    min-width: 48px;
+    min-height: 48px;
+  }
+}
+
 .btn-primary {
   background: #1d4ed8;
   color: #ffffff;
@@ -115,6 +143,7 @@ button:disabled {
 
 .collaborator-row {
   display: flex;
+  align-items: flex-start;
   gap: 0.5rem;
   margin-bottom: 0.5rem;
 }
@@ -123,6 +152,28 @@ button:disabled {
 }
 .collaborator-row input:last-child {
   flex: 1;
+}
+
+/* #920 — class-based field wrappers (replaced inline flex styles) so the
+   address / percentage / remove controls can stack vertically on mobile. */
+.collaborator-field {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.collaborator-field--address {
+  flex: 3;
+}
+
+.collaborator-field--percentage {
+  flex: 1;
+}
+
+.collaborator-row .btn-danger {
+  flex-shrink: 0;
+  align-self: flex-end;
+  margin-bottom: 0.25rem;
 }
 
 .status {
@@ -246,6 +297,25 @@ td {
 td:last-child {
   text-align: right;
   white-space: nowrap;
+}
+
+/* #920 — form buttons row: let action buttons wrap and stretch on phones
+   instead of overflowing horizontally. */
+@media (max-width: 520px) {
+  .row {
+    flex-wrap: wrap;
+  }
+
+  .row > button {
+    flex: 1 1 100%;
+    min-height: 48px; /* 48px touch target */
+  }
+
+  table {
+    display: block;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
 }
 
 .share-total {
@@ -700,5 +770,31 @@ small {
   .recipient-preview__row strong {
     grid-column: 1 / -1;
     text-align: left;
+  }
+
+  /* #920 — stack InitializeForm collaborator fields vertically on phones.
+     Each field keeps a 48px+ input height for comfortable touch input. */
+  .collaborator-row {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 0.25rem;
+  }
+
+  .collaborator-field--address,
+  .collaborator-field--percentage {
+    flex: 1 1 auto;
+    width: 100%;
+  }
+
+  .collaborator-row input {
+    min-height: 48px; /* 48px touch target */
+    font-size: 16px; /* prevents iOS Safari auto-zoom on focus */
+  }
+
+  .collaborator-row .btn-danger {
+    align-self: flex-end;
+    min-width: 48px;
+    min-height: 48px; /* 48px touch target */
+    margin-bottom: 0.5rem;
   }
 }

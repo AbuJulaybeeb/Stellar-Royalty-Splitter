@@ -329,59 +329,98 @@ export function initializeDatabase() {
         `,
     },
     {
-      // #927: Twilio SMS notification channel — opt-in preferences + send log
+      // #939: Salesforce CRM integration — OAuth connections, collaborator ⇄
+      // Contact mappings, sync progress, and the CRM activity audit trail.
+      // `contributor_status` is also created here (IF NOT EXISTS) because the
+      // inbound Salesforce webhook flips collaborator status and the table was
+      // otherwise only assumed to exist.
       version: 15,
       sql: `
-          CREATE TABLE IF NOT EXISTS sms_preferences (
+          CREATE TABLE IF NOT EXISTS contributor_status (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            walletAddress TEXT NOT NULL UNIQUE,
-            smsEnabled INTEGER NOT NULL DEFAULT 0,
-            phoneNumber TEXT,
-            updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP
+            contractId TEXT NOT NULL,
+            address TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active'
+              CHECK(status IN ('active', 'suspended', 'deactivated')),
+            reason TEXT,
+            suspendedAt DATETIME,
+            deactivatedAt DATETIME,
+            updatedBy TEXT,
+            createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(contractId, address)
           );
-          CREATE INDEX IF NOT EXISTS idx_sms_preferences_wallet ON sms_preferences(walletAddress);
+          CREATE INDEX IF NOT EXISTS idx_contributor_status_contract
+            ON contributor_status(contractId);
 
-          CREATE TABLE IF NOT EXISTS sms_send_log (
+          CREATE TABLE IF NOT EXISTS crm_connections (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            walletAddress TEXT NOT NULL,
-            eventType TEXT NOT NULL,
-            phoneNumber TEXT NOT NULL,
-            status TEXT NOT NULL,
-            providerSid TEXT,
-            failureReason TEXT,
+            contractId TEXT NOT NULL,
+            provider TEXT NOT NULL DEFAULT 'salesforce',
+            instanceUrl TEXT NOT NULL,
+            orgId TEXT,
+            accessToken TEXT,
+            refreshToken TEXT,
+            accessTokenExpiresAt DATETIME,
+            connectedBy TEXT,
+            status TEXT NOT NULL DEFAULT 'connected'
+              CHECK(status IN ('connected', 'disconnected')),
+            createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(contractId, provider)
+          );
+
+          CREATE TABLE IF NOT EXISTS crm_sync_status (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            contractId TEXT NOT NULL,
+            provider TEXT NOT NULL DEFAULT 'salesforce',
+            status TEXT NOT NULL DEFAULT 'idle'
+              CHECK(status IN ('idle', 'running', 'completed', 'failed')),
+            totalCollaborators INTEGER NOT NULL DEFAULT 0,
+            syncedCount INTEGER NOT NULL DEFAULT 0,
+            failedCount INTEGER NOT NULL DEFAULT 0,
+            lastSyncedAt DATETIME,
+            lastError TEXT,
+            startedAt DATETIME,
+            completedAt DATETIME,
+            updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(contractId, provider)
+          );
+
+          CREATE TABLE IF NOT EXISTS crm_contact_mappings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            contractId TEXT NOT NULL,
+            provider TEXT NOT NULL DEFAULT 'salesforce',
+            address TEXT NOT NULL,
+            externalId TEXT NOT NULL,
+            name TEXT,
+            email TEXT,
+            syncState TEXT NOT NULL DEFAULT 'synced',
+            lastDirection TEXT DEFAULT 'outbound'
+              CHECK(lastDirection IN ('outbound', 'inbound')),
+            lastSyncedAt DATETIME,
+            createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(contractId, provider, address)
+          );
+          CREATE INDEX IF NOT EXISTS idx_crm_contact_mappings_external
+            ON crm_contact_mappings(provider, externalId);
+
+          CREATE TABLE IF NOT EXISTS crm_activity_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            contractId TEXT NOT NULL,
+            provider TEXT NOT NULL DEFAULT 'salesforce',
+            address TEXT,
+            activityType TEXT NOT NULL,
+            externalId TEXT,
+            payload TEXT,
+            status TEXT NOT NULL DEFAULT 'success'
+              CHECK(status IN ('success', 'failed', 'skipped')),
+            error TEXT,
             createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
           );
-          CREATE INDEX IF NOT EXISTS idx_sms_send_log_wallet ON sms_send_log(walletAddress);
-          CREATE INDEX IF NOT EXISTS idx_sms_send_log_created_at ON sms_send_log(createdAt);
-        `,
-    },
-    {
-      // #928: OpenSea marketplace webhook integration — event idempotency/
-      // audit trail + per-contract auto-recording toggle
-      version: 16,
-      sql: `
-          CREATE TABLE IF NOT EXISTS marketplace_events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            provider TEXT NOT NULL,
-            eventId TEXT NOT NULL,
-            contractId TEXT NOT NULL,
-            nftId TEXT NOT NULL,
-            salePrice TEXT NOT NULL,
-            royaltyAmount TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'recorded',
-            rawPayload TEXT,
-            createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(provider, eventId)
-          );
-          CREATE INDEX IF NOT EXISTS idx_marketplace_events_contract ON marketplace_events(contractId);
-          CREATE INDEX IF NOT EXISTS idx_marketplace_events_created_at ON marketplace_events(createdAt);
-
-          CREATE TABLE IF NOT EXISTS marketplace_settings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            contractId TEXT NOT NULL UNIQUE,
-            autoRecordingEnabled INTEGER NOT NULL DEFAULT 1,
-            updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP
-          );
+          CREATE INDEX IF NOT EXISTS idx_crm_activity_log_contract
+            ON crm_activity_log(contractId, createdAt DESC);
         `,
     },
   ];

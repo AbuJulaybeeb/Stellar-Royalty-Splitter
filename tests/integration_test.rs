@@ -6678,3 +6678,511 @@ fn test_emergency_pause_multisig_threshold_and_signer_validations() {
     // Contract remains unpaused
     assert!(!client.is_emergency_paused());
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #933 — NFT metadata binding for dynamic rates
+// ─────────────────────────────────────────────────────────────────────────────
+
+mod metadata_binding {
+    use super::*;
+    use soroban_sdk::testutils::AuthorizedFunction;
+    use soroban_sdk::{contract, contractimpl, vec, Symbol};
+    use stellar_royalty_splitter::{MetadataBinding, METADATA_CACHE_TTL_SECS};
+
+    /// Stand-in for the external metadata oracle. Returns the configured
+    /// per-token override and counts how often it is queried.
+    #[contract]
+    pub struct MockMetadataOracle;
+
+    #[contractimpl]
+    impl MockMetadataOracle {
+        pub fn set_override(env: Env, token_id: u64, rate: Option<u32>) {
+            env.storage().instance().set(&token_id, &rate);
+        }
+
+        pub fn get_rate_override(env: Env, _collection: Address, token_id: u64) -> Option<u32> {
+            let calls: u32 = env
+                .storage()
+                .instance()
+                .get(&symbol_short!("calls"))
+                .unwrap_or(0);
+            env.storage()
+                .instance()
+                .set(&symbol_short!("calls"), &(calls + 1));
+            env.storage()
+                .instance()
+                .get::<u64, Option<u32>>(&token_id)
+                .flatten()
+        }
+
+        pub fn calls(env: Env) -> u32 {
+            env.storage()
+                .instance()
+                .get(&symbol_short!("calls"))
+                .unwrap_or(0)
+        }
+    }
+
+    struct Fixture<'a> {
+        env: &'a Env,
+        client: RoyaltySplitterClient<'a>,
+        oracle: MockMetadataOracleClient<'a>,
+        collection: Address,
+    }
+
+    /// Initialized splitter with a 5% default rate and an unbound mock oracle.
+    fn fixture(env: &Env) -> Fixture<'_> {
+        env.mock_all_auths();
+        env.ledger().with_mut(|l| l.timestamp = 1_000_000);
+        let (_, client) = setup(env);
+        client.initialize(
+            &vec![env, Address::generate(env), Address::generate(env)],
+            &vec![env, 5_000_u32, 5_000_u32],
+        );
+        client.set_royalty_rate(&500);
+        let oracle_id = env.register_contract(None, MockMetadataOracle);
+        let oracle = MockMetadataOracleClient::new(env, &oracle_id);
+        let collection = Address::generate(env);
+        Fixture {
+            env,
+            client,
+            oracle,
+            collection,
+        }
+    }
+
+    #[test]
+    fn admin_can_bind_and_unbind() {
+        let env = Env::default();
+        let f = fixture(&env);
+        assert_eq!(f.client.get_metadata_binding(), None);
+
+        f.client
+            .bind_to_nft_metadata(&f.collection, &f.oracle.address);
+        assert_eq!(
+            f.client.get_metadata_binding(),
+            Some(MetadataBinding {
+                collection_address: f.collection.clone(),
+                metadata_oracle: f.oracle.address.clone(),
+            })
+        );
+
+        f.client.unbind_nft_metadata();
+        assert_eq!(f.client.get_metadata_binding(), None);
+        assert_eq!(
+            f.client.try_unbind_nft_metadata(),
+            Err(Ok(ContractError::NO_METADATA_BINDING))
+        );
+    }
+
+    #[test]
+    fn bind_requires_admin_auth() {
+        let env = Env::default();
+        let (_, client) = setup(&env);
+        let admin = Address::generate(&env);
+        env.mock_all_auths();
+        client.initialize(&vec![&env, admin.clone()], &vec![&env, 10_000_u32]);
+
+        client.bind_to_nft_metadata(&Address::generate(&env), &Address::generate(&env));
+        let auths = env.auths();
+        assert_eq!(auths.len(), 1);
+        assert_eq!(auths[0].0, admin);
+        match &auths[0].1.function {
+            AuthorizedFunction::Contract((contract, function, _)) => {
+                assert_eq!(contract, &client.address);
+                assert_eq!(function, &Symbol::new(&env, "bind_to_nft_metadata"));
+            }
+            _ => panic!("expected a contract invocation"),
+        }
+    }
+
+    #[test]
+    fn oracle_override_replaces_default_rate() {
+        let env = Env::default();
+        let f = fixture(&env);
+        f.client
+            .bind_to_nft_metadata(&f.collection, &f.oracle.address);
+        f.oracle.set_override(&7, &Some(1_500)); // rare token: 15%
+
+        assert_eq!(f.client.record_nft_secondary_sale(&7, &10_000), 1_500);
+        // A token the oracle has no override for earns the default 5%.
+        assert_eq!(f.client.record_nft_secondary_sale(&8, &10_000), 500);
+        // The rate-agnostic entry point is unaffected by the binding.
+        assert_eq!(f.client.record_secondary_sale(&10_000), 500);
+    }
+
+    #[test]
+    fn unbound_contract_uses_default_rate_without_querying() {
+        let env = Env::default();
+        let f = fixture(&env);
+        f.oracle.set_override(&7, &Some(1_500));
+        assert_eq!(f.client.record_nft_secondary_sale(&7, &10_000), 500);
+        assert_eq!(f.oracle.calls(), 0);
+    }
+
+    #[test]
+    fn unavailable_oracle_falls_back_to_default_rate() {
+        let env = Env::default();
+        let f = fixture(&env);
+        // Not a contract: every invocation fails.
+        let dead_oracle = Address::generate(f.env);
+        f.client.bind_to_nft_metadata(&f.collection, &dead_oracle);
+        assert_eq!(f.client.record_nft_secondary_sale(&7, &10_000), 500);
+
+        // Failures are not cached: once a working oracle is bound it is used.
+        f.oracle.set_override(&7, &Some(1_500));
+        f.client
+            .bind_to_nft_metadata(&f.collection, &f.oracle.address);
+        assert_eq!(f.client.record_nft_secondary_sale(&7, &10_000), 1_500);
+    }
+
+    #[test]
+    fn out_of_range_override_is_ignored() {
+        let env = Env::default();
+        let f = fixture(&env);
+        f.client
+            .bind_to_nft_metadata(&f.collection, &f.oracle.address);
+        f.oracle.set_override(&7, &Some(10_001));
+        assert_eq!(f.client.get_nft_royalty_rate(&7), 500);
+    }
+
+    #[test]
+    fn metadata_queries_are_cached_for_one_hour() {
+        let env = Env::default();
+        let f = fixture(&env);
+        f.client
+            .bind_to_nft_metadata(&f.collection, &f.oracle.address);
+        f.oracle.set_override(&7, &Some(1_500));
+
+        assert_eq!(f.client.record_nft_secondary_sale(&7, &10_000), 1_500);
+        assert_eq!(f.oracle.calls(), 1);
+
+        // The oracle changes its answer, but the cached one is served.
+        f.oracle.set_override(&7, &Some(2_000));
+        f.env
+            .ledger()
+            .with_mut(|l| l.timestamp += METADATA_CACHE_TTL_SECS - 1);
+        assert_eq!(f.client.record_nft_secondary_sale(&7, &10_000), 1_500);
+        assert_eq!(f.oracle.calls(), 1);
+
+        // "No override" answers are cached too.
+        assert_eq!(f.client.record_nft_secondary_sale(&8, &10_000), 500);
+        assert_eq!(f.client.record_nft_secondary_sale(&8, &10_000), 500);
+        assert_eq!(f.oracle.calls(), 2);
+
+        // After an hour the entry expires and the oracle is asked again.
+        f.env.ledger().with_mut(|l| l.timestamp += 1);
+        assert_eq!(f.client.record_nft_secondary_sale(&7, &10_000), 2_000);
+        assert_eq!(f.oracle.calls(), 3);
+    }
+
+    #[test]
+    fn rebinding_to_new_oracle_bypasses_old_cache() {
+        let env = Env::default();
+        let f = fixture(&env);
+        f.client
+            .bind_to_nft_metadata(&f.collection, &f.oracle.address);
+        f.oracle.set_override(&7, &Some(1_500));
+        assert_eq!(f.client.get_nft_royalty_rate(&7), 1_500);
+
+        let second_id = f.env.register_contract(None, MockMetadataOracle);
+        let second = MockMetadataOracleClient::new(f.env, &second_id);
+        second.set_override(&7, &Some(250));
+        f.client.bind_to_nft_metadata(&f.collection, &second_id);
+
+        assert_eq!(f.client.get_nft_royalty_rate(&7), 250);
+        assert_eq!(second.calls(), 1);
+    }
+
+    #[test]
+    fn nft_sale_rejects_non_positive_price() {
+        let env = Env::default();
+        let f = fixture(&env);
+        assert_eq!(
+            f.client.try_record_nft_secondary_sale(&7, &0),
+            Err(Ok(ContractError::SalePriceNotPositive))
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #932 — Linked pools
+// ─────────────────────────────────────────────────────────────────────────────
+
+mod linked_pools {
+    use super::*;
+    use soroban_sdk::testutils::AuthorizedFunction;
+    use soroban_sdk::{vec, Symbol};
+    use stellar_royalty_splitter::{LinkedPool, MAX_LINKED_POOLS};
+
+    /// Registers and initializes a splitter with the given collaborator shares.
+    fn splitter<'a>(
+        env: &'a Env,
+        shares: &[u32],
+    ) -> (RoyaltySplitterClient<'a>, SorobanVec<Address>) {
+        let (_, client) = setup(env);
+        let mut collaborators = SorobanVec::new(env);
+        let mut share_vec = SorobanVec::new(env);
+        for share in shares {
+            collaborators.push_back(Address::generate(env));
+            share_vec.push_back(*share);
+        }
+        client.initialize(&collaborators, &share_vec);
+        (client, collaborators)
+    }
+
+    fn balance(env: &Env, token: &Address, who: &Address) -> i128 {
+        TokenClient::new(env, token).balance(who)
+    }
+
+    fn env_with_token() -> (Env, Address) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let token = make_token(&env, &Address::generate(&env));
+        (env, token)
+    }
+
+    #[test]
+    fn admin_can_link_and_unlink_pool() {
+        let (env, _) = env_with_token();
+        let (source, _) = splitter(&env, &[5_000, 5_000]);
+        let (project, _) = splitter(&env, &[10_000]);
+
+        project.link_pool(&source.address, &3_000);
+        assert_eq!(
+            project.get_linked_pools(),
+            vec![
+                &env,
+                LinkedPool {
+                    source_contract: source.address.clone(),
+                    share: 3_000,
+                }
+            ]
+        );
+
+        project.unlink_pool(&source.address);
+        assert_eq!(project.get_linked_pools().len(), 0);
+        assert_eq!(
+            project.try_unlink_pool(&source.address),
+            Err(Ok(ContractError::POOL_NOT_LINKED))
+        );
+    }
+
+    #[test]
+    fn link_pool_validates_source_and_shares() {
+        let (env, _) = env_with_token();
+        let (source, _) = splitter(&env, &[5_000, 5_000]);
+        let (project, _) = splitter(&env, &[10_000]);
+
+        // Self-link, a non-contract address, and an uninitialized splitter are rejected.
+        assert_eq!(
+            project.try_link_pool(&project.address, &1_000),
+            Err(Ok(ContractError::POOL_ALREADY_LINKED))
+        );
+        assert_eq!(
+            project.try_link_pool(&Address::generate(&env), &1_000),
+            Err(Ok(ContractError::INVALID_LINKED_POOL))
+        );
+        let (uninitialized, _) = setup(&env);
+        assert_eq!(
+            project.try_link_pool(&uninitialized, &1_000),
+            Err(Ok(ContractError::INVALID_LINKED_POOL))
+        );
+
+        assert_eq!(
+            project.try_link_pool(&source.address, &0),
+            Err(Ok(ContractError::InvalidBasisPoints))
+        );
+        assert_eq!(
+            project.try_link_pool(&source.address, &10_001),
+            Err(Ok(ContractError::InvalidBasisPoints))
+        );
+
+        project.link_pool(&source.address, &6_000);
+        assert_eq!(
+            project.try_link_pool(&source.address, &1_000),
+            Err(Ok(ContractError::POOL_ALREADY_LINKED))
+        );
+        let (other, _) = splitter(&env, &[10_000]);
+        assert_eq!(
+            project.try_link_pool(&other.address, &4_001),
+            Err(Ok(ContractError::INVALID_LINKED_SHARE_TOTAL))
+        );
+    }
+
+    #[test]
+    fn link_pool_caps_number_of_links() {
+        let (env, _) = env_with_token();
+        let (project, _) = splitter(&env, &[10_000]);
+        for _ in 0..MAX_LINKED_POOLS {
+            let (source, _) = splitter(&env, &[10_000]);
+            project.link_pool(&source.address, &100);
+        }
+        let (extra, _) = splitter(&env, &[10_000]);
+        assert_eq!(
+            project.try_link_pool(&extra.address, &100),
+            Err(Ok(ContractError::TOO_MANY_LINKED_POOLS))
+        );
+    }
+
+    #[test]
+    fn link_pool_requires_admin_auth() {
+        let (env, _) = env_with_token();
+        let (source, _) = splitter(&env, &[10_000]);
+        let (project, project_collabs) = splitter(&env, &[10_000]);
+
+        project.link_pool(&source.address, &1_000);
+        let auths = env.auths();
+        assert_eq!(auths.len(), 1);
+        // The first collaborator is the admin.
+        assert_eq!(auths[0].0, project_collabs.get(0).unwrap());
+        match &auths[0].1.function {
+            AuthorizedFunction::Contract((contract, function, _)) => {
+                assert_eq!(contract, &project.address);
+                assert_eq!(function, &Symbol::new(&env, "link_pool"));
+            }
+            _ => panic!("expected a contract invocation"),
+        }
+    }
+
+    #[test]
+    fn distribution_forwards_to_linked_pool_which_pays_its_collaborators() {
+        let (env, token) = env_with_token();
+        let (source, source_collabs) = splitter(&env, &[5_000, 5_000]);
+        let (project, project_collabs) = splitter(&env, &[10_000]);
+        project.link_pool(&source.address, &3_000);
+
+        mint(&env, &token, &project.address, 10_000);
+        project.distribute(&token);
+
+        // 30% forwarded to the source pool, 70% paid locally.
+        assert_eq!(balance(&env, &token, &source.address), 3_000);
+        assert_eq!(
+            balance(&env, &token, &project_collabs.get(0).unwrap()),
+            7_000
+        );
+        assert_eq!(balance(&env, &token, &project.address), 0);
+
+        // The linked contract distributes what it received to its own collaborators.
+        source.distribute(&token);
+        assert_eq!(
+            balance(&env, &token, &source_collabs.get(0).unwrap()),
+            1_500
+        );
+        assert_eq!(
+            balance(&env, &token, &source_collabs.get(1).unwrap()),
+            1_500
+        );
+    }
+
+    #[test]
+    fn multiple_links_each_receive_their_share() {
+        let (env, token) = env_with_token();
+        let (source_a, _) = splitter(&env, &[10_000]);
+        let (source_b, _) = splitter(&env, &[10_000]);
+        let (project, project_collabs) = splitter(&env, &[6_000, 4_000]);
+        project.link_pool(&source_a.address, &2_000);
+        project.link_pool(&source_b.address, &3_000);
+
+        mint(&env, &token, &project.address, 10_000);
+        project.distribute(&token);
+
+        assert_eq!(balance(&env, &token, &source_a.address), 2_000);
+        assert_eq!(balance(&env, &token, &source_b.address), 3_000);
+        // The remaining 5,000 is split 60/40 locally.
+        assert_eq!(
+            balance(&env, &token, &project_collabs.get(0).unwrap()),
+            3_000
+        );
+        assert_eq!(
+            balance(&env, &token, &project_collabs.get(1).unwrap()),
+            2_000
+        );
+    }
+
+    #[test]
+    fn fully_linked_contract_forwards_everything() {
+        let (env, token) = env_with_token();
+        let (source, _) = splitter(&env, &[10_000]);
+        let (project, project_collabs) = splitter(&env, &[10_000]);
+        project.link_pool(&source.address, &10_000);
+
+        mint(&env, &token, &project.address, 5_000);
+        project.distribute(&token);
+
+        assert_eq!(balance(&env, &token, &source.address), 5_000);
+        assert_eq!(balance(&env, &token, &project_collabs.get(0).unwrap()), 0);
+    }
+
+    #[test]
+    fn unlinked_pool_no_longer_receives_forwards() {
+        let (env, token) = env_with_token();
+        let (source, _) = splitter(&env, &[10_000]);
+        let (project, project_collabs) = splitter(&env, &[10_000]);
+        project.link_pool(&source.address, &3_000);
+        project.unlink_pool(&source.address);
+
+        mint(&env, &token, &project.address, 10_000);
+        project.distribute(&token);
+
+        assert_eq!(balance(&env, &token, &source.address), 0);
+        assert_eq!(
+            balance(&env, &token, &project_collabs.get(0).unwrap()),
+            10_000
+        );
+    }
+
+    #[test]
+    fn batch_distribute_also_forwards() {
+        let (env, token) = env_with_token();
+        let (source, _) = splitter(&env, &[10_000]);
+        let (project, project_collabs) = splitter(&env, &[10_000]);
+        project.link_pool(&source.address, &2_500);
+
+        mint(&env, &token, &project.address, 8_000);
+        project.batch_distribute(&vec![&env, token.clone()]);
+
+        assert_eq!(balance(&env, &token, &source.address), 2_000);
+        assert_eq!(
+            balance(&env, &token, &project_collabs.get(0).unwrap()),
+            6_000
+        );
+    }
+
+    #[test]
+    fn effective_shares_include_linked_pool() {
+        let (env, _) = env_with_token();
+        let (source, source_collabs) = splitter(&env, &[5_000, 5_000]);
+        let (project, project_collabs) = splitter(&env, &[6_000, 4_000]);
+
+        // Unlinked: effective shares are just the local ones.
+        let shares = project.get_effective_shares();
+        assert_eq!(shares.get(project_collabs.get(0).unwrap()), Some(6_000));
+        assert_eq!(shares.get(project_collabs.get(1).unwrap()), Some(4_000));
+
+        project.link_pool(&source.address, &3_000);
+        let shares = project.get_effective_shares();
+        assert_eq!(shares.len(), 4);
+        assert_eq!(shares.get(project_collabs.get(0).unwrap()), Some(4_200));
+        assert_eq!(shares.get(project_collabs.get(1).unwrap()), Some(2_800));
+        assert_eq!(shares.get(source_collabs.get(0).unwrap()), Some(1_500));
+        assert_eq!(shares.get(source_collabs.get(1).unwrap()), Some(1_500));
+        let total: u32 = shares.values().iter().sum();
+        assert_eq!(total, 10_000);
+    }
+
+    #[test]
+    fn effective_shares_merge_collaborator_present_in_both_pools() {
+        let (env, _) = env_with_token();
+        let shared = Address::generate(&env);
+        let (_, source) = setup(&env);
+        source.initialize(&vec![&env, shared.clone()], &vec![&env, 10_000_u32]);
+        let (_, project) = setup(&env);
+        project.initialize(&vec![&env, shared.clone()], &vec![&env, 10_000_u32]);
+
+        project.link_pool(&source.address, &4_000);
+        let shares = project.get_effective_shares();
+        assert_eq!(shares.len(), 1);
+        assert_eq!(shares.get(shared), Some(10_000));
+    }
+}
