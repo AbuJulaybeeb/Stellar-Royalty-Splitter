@@ -299,32 +299,28 @@ export {
   resetHealthMonitorState,
 } from "./health-monitor.js";
 
-// QuickBooks accounting sync (#940)
+// Salesforce CRM integration (#939)
 export {
-  ensureAccountingSyncTables,
-  saveQuickBooksConnection,
-  getQuickBooksConnection,
-  getQuickBooksTokens,
-  updateQuickBooksAccessToken,
-  setQuickBooksConnectionStatus,
-  createQuickBooksOAuthState,
-  redeemQuickBooksOAuthState,
-  createAccountingSync,
-  updateAccountingSyncStatus,
-  getAccountingSync,
-  getRecentAccountingSyncs,
-  getLatestAccountingSync,
-  getUnsyncedDistributionTransactions,
-  getDistributionTransactionById,
-  getDistributionPayouts,
-  addAccountingSyncItem,
-  getAccountingSyncItem,
-  getAccountingSyncItems,
-  findAccountingSyncItemByQuickBooksId,
-  markAccountingSyncItemSynced,
-  markAccountingSyncItemFailed,
-  markAccountingSyncItemConfirmed,
-} from "./accounting-sync.js";
+  CRM_PROVIDER,
+  CRM_SYNC_STATES,
+  CRM_ACTIVITY_STATES,
+  CRM_SYNC_DIRECTIONS,
+  getConnection,
+  saveConnection,
+  updateConnectionTokens,
+  disconnectConnection,
+  getSyncStatus,
+  startSync,
+  incrementSyncProgress,
+  finishSync,
+  getContactMappingByAddress,
+  findContactMappingByExternalId,
+  listContactMappings,
+  upsertContactMapping,
+  recordCrmActivity,
+  listCrmActivities,
+  listKnownCollaborators,
+} from "./crm-sync-status.js";
 
 // Default export for backwards compatibility
 import { db } from "./core.js";

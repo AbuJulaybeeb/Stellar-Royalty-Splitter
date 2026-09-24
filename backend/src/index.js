@@ -55,6 +55,7 @@ import { csvImportRouter } from "./routes/csv-import.js";
 import { quickbooksRouter } from "./routes/accounting/quickbooks.js";
 import { contributorTaxRouter } from "./routes/contributor-tax.js";
 import { notificationsRouter } from "./routes/notifications.js";
+import { salesforceRouter } from "./routes/crm/salesforce.js";
 import { paymentHoldsRouter } from "./routes/payment-holds.js";
 import { earningsHistoryRouter } from "./routes/earnings-history.js";
 import { versionRouter } from "./routes/version.js";
@@ -280,14 +281,15 @@ app.use((req, _res, next) => {
 
 // Global max request body size — configurable via env, defaults to prior hardcoded value.
 const MAX_REQUEST_BODY_SIZE = process.env.MAX_REQUEST_BODY_SIZE ?? "10kb";
-// `verify` captures the raw request bytes before JSON parsing so signed
-// webhooks (QuickBooks `intuit-signature`, etc.) can recompute the HMAC over
-// the exact payload that was sent rather than a re-serialisation (#940).
 app.use(
   express.json({
     limit: MAX_REQUEST_BODY_SIZE,
+    // #939: retain the exact bytes of Salesforce webhook requests so their
+    // HMAC-SHA256 signature can be verified after JSON parsing.
     verify: (req, _res, buf) => {
-      req.rawBody = buf;
+      if (req.originalUrl?.startsWith("/api/v1/crm/salesforce/webhook")) {
+        req.rawBody = buf;
+      }
     },
   })
 );
@@ -393,6 +395,9 @@ app.use("/api/v1/contributor-tax", contributorTaxRouter);
 
 // Real-time notifications (#594)
 app.use("/api/v1/notifications", notificationsRouter);
+
+// Salesforce CRM bidirectional sync (#939)
+app.use("/api/v1/crm/salesforce", salesforceRouter);
 
 // Payment hold/release system (#596)
 app.use("/api/v1/payment-holds", writeLimiter);
