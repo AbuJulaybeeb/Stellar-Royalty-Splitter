@@ -271,6 +271,9 @@ export const AUDIT_ACTIONS = [
   "secondary_sale_recorded",
   "royalty_rate_set",
   "secondary_distribution_initiated",
+  "quickbooks_connected",
+  "quickbooks_distributions_synced",
+  "quickbooks_invoice_paid",
 ];
 
 export function validate(schema) {

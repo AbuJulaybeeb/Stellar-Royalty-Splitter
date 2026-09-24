@@ -299,6 +299,33 @@ export {
   resetHealthMonitorState,
 } from "./health-monitor.js";
 
+// QuickBooks accounting sync (#940)
+export {
+  ensureAccountingSyncTables,
+  saveQuickBooksConnection,
+  getQuickBooksConnection,
+  getQuickBooksTokens,
+  updateQuickBooksAccessToken,
+  setQuickBooksConnectionStatus,
+  createQuickBooksOAuthState,
+  redeemQuickBooksOAuthState,
+  createAccountingSync,
+  updateAccountingSyncStatus,
+  getAccountingSync,
+  getRecentAccountingSyncs,
+  getLatestAccountingSync,
+  getUnsyncedDistributionTransactions,
+  getDistributionTransactionById,
+  getDistributionPayouts,
+  addAccountingSyncItem,
+  getAccountingSyncItem,
+  getAccountingSyncItems,
+  findAccountingSyncItemByQuickBooksId,
+  markAccountingSyncItemSynced,
+  markAccountingSyncItemFailed,
+  markAccountingSyncItemConfirmed,
+} from "./accounting-sync.js";
+
 // Default export for backwards compatibility
 import { db } from "./core.js";
 export default db;
