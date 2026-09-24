@@ -614,7 +614,10 @@ export default function InitializeForm({
       {collaborators.map((c: Collaborator, i: number) => (
         <div key={i}>
           <div className="collaborator-row">
-            <div style={{ flex: 3, display: "flex", flexDirection: "column" }}>
+            {/* #920 — layout classes instead of inline flex styles so the
+                address/percentage/remove controls can stack vertically on
+                mobile via the media query in index.css. */}
+            <div className="collaborator-field collaborator-field--address">
               <label htmlFor={`collaborator-${i}-address`}>
                 Collaborator {i + 1} wallet address
               </label>
@@ -659,7 +662,7 @@ export default function InitializeForm({
                 </span>
               )}
             </div>
-            <div style={{ flex: 1, display: "flex", flexDirection: "column" }}>
+            <div className="collaborator-field collaborator-field--percentage">
               <label htmlFor={`collaborator-${i}-percentage`}>
                 Collaborator {i + 1} percentage
               </label>
