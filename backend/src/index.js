@@ -56,6 +56,7 @@ import { quickbooksRouter } from "./routes/accounting/quickbooks.js";
 import { contributorTaxRouter } from "./routes/contributor-tax.js";
 import { notificationsRouter } from "./routes/notifications.js";
 import { salesforceRouter } from "./routes/crm/salesforce.js";
+import { stripeRouter } from "./routes/payments/stripe.js";
 import { paymentHoldsRouter } from "./routes/payment-holds.js";
 import { earningsHistoryRouter } from "./routes/earnings-history.js";
 import { versionRouter } from "./routes/version.js";
@@ -404,6 +405,10 @@ app.use("/api/v1/notifications", notificationsRouter);
 
 // SMS notification preferences (#927)
 app.use("/api/v1/notifications/sms", smsPreferencesRouter);
+
+// Stripe fiat payout integration (#924)
+app.use("/api/v1/payments/stripe", writeLimiter);
+app.use("/api/v1/payments/stripe", stripeRouter);
 
 // Payment hold/release system (#596)
 app.use("/api/v1/payment-holds", writeLimiter);

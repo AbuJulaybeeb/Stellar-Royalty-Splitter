@@ -423,6 +423,62 @@ export function initializeDatabase() {
             ON crm_activity_log(contractId, createdAt DESC);
         `,
     },
+    {
+      // #924: Stripe fiat payout integration — linked Connect accounts and
+      // payout records (status tracked pending -> completed/failed via the
+      // Stripe webhook).
+      version: 16,
+      sql: `
+          CREATE TABLE IF NOT EXISTS stripe_accounts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            walletAddress TEXT NOT NULL UNIQUE,
+            stripeAccountId TEXT NOT NULL UNIQUE,
+            status TEXT NOT NULL DEFAULT 'pending'
+              CHECK(status IN ('pending', 'connected', 'disconnected')),
+            createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP
+          );
+          CREATE INDEX IF NOT EXISTS idx_stripe_accounts_walletAddress
+            ON stripe_accounts(walletAddress);
+          CREATE INDEX IF NOT EXISTS idx_stripe_accounts_stripeAccountId
+            ON stripe_accounts(stripeAccountId);
+
+          CREATE TABLE IF NOT EXISTS stripe_payouts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            walletAddress TEXT NOT NULL,
+            stripeAccountId TEXT NOT NULL,
+            stripePayoutId TEXT UNIQUE,
+            amountXlm TEXT NOT NULL,
+            amountUsdCents INTEGER NOT NULL,
+            xlmUsdRate TEXT NOT NULL,
+            frequency TEXT NOT NULL DEFAULT 'once'
+              CHECK(frequency IN ('once', 'weekly', 'monthly')),
+            status TEXT NOT NULL DEFAULT 'pending'
+              CHECK(status IN ('pending', 'in_transit', 'completed', 'failed')),
+            failureReason TEXT,
+            createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP
+          );
+          CREATE INDEX IF NOT EXISTS idx_stripe_payouts_walletAddress
+            ON stripe_payouts(walletAddress, createdAt DESC);
+          CREATE INDEX IF NOT EXISTS idx_stripe_payouts_stripePayoutId
+            ON stripe_payouts(stripePayoutId);
+          CREATE INDEX IF NOT EXISTS idx_stripe_payouts_status
+            ON stripe_payouts(status);
+
+          CREATE TABLE IF NOT EXISTS stripe_webhook_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            stripeEventId TEXT NOT NULL UNIQUE,
+            eventType TEXT NOT NULL,
+            payoutId INTEGER,
+            payload TEXT,
+            createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(payoutId) REFERENCES stripe_payouts(id) ON DELETE SET NULL
+          );
+          CREATE INDEX IF NOT EXISTS idx_stripe_webhook_events_type
+            ON stripe_webhook_events(eventType, createdAt DESC);
+        `,
+    },
   ];
 
   for (const migration of migrations) {
