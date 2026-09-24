@@ -28,6 +28,11 @@ import {
 } from "../validation.js";
 import { sendError } from "../error-response.js";
 import { broadcastToContract } from "../websocket.js";
+import {
+  recordSecondaryRoyaltyAccrued,
+  recordSecondaryRoyaltyDistributed,
+  recordSecondarySaleProcessing,
+} from "../metrics.js";
 
 export const secondaryRoyaltyRouter = Router();
 
@@ -61,6 +66,7 @@ secondaryRoyaltyRouter.get(
  * Returns: { xdr, transactionId, royaltyAmount }
  */
 secondaryRoyaltyRouter.post("/", validate(recordSecondarySaleSchema), async (req, res, next) => {
+  const processingStart = Date.now();
   try {
     const {
       contractId,
@@ -130,6 +136,9 @@ secondaryRoyaltyRouter.post("/", validate(recordSecondarySaleSchema), async (req
       salePrice: salePrice.toString(),
       royaltyAmount: royaltyAmount.toString(),
     });
+
+    recordSecondaryRoyaltyAccrued(contractId, royaltyAmount);
+    recordSecondarySaleProcessing(Date.now() - processingStart);
 
     res.json({
       xdr: txXdr,
@@ -254,6 +263,7 @@ secondaryRoyaltyRouter.post(
 
       // Mark sales as distributed
       markSalesDistributed(pendingSales.map((s) => s.id));
+      recordSecondaryRoyaltyDistributed(contractId, totalRoyalties);
 
       addAuditLog(contractId, "secondary_distribution_initiated", walletAddress, {
         transactionId,

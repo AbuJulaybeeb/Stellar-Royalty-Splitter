@@ -5,6 +5,8 @@
 
 import { db, countWrite } from "./core.js";
 import { AUDIT_ACTIONS } from "../validation.js";
+import { recordAuditEvent } from "../services/audit-trail.js";
+import { recordContractStateChange } from "../metrics.js";
 
 // Field names that must never end up in an audit log's `details` blob. This
 // is a defense-in-depth guard on top of the fact that no call site in this
@@ -130,6 +132,11 @@ export function addAuditLog(contractId, action, user, details) {
     VALUES (?, ?, ?, ?)
   `);
 
-  stmt.run(contractId, action, user, JSON.stringify(stripSensitiveDetails(details)));
+  const cleanDetails = stripSensitiveDetails(details);
+  stmt.run(contractId, action, user, JSON.stringify(cleanDetails));
   countWrite();
+
+  // #938: every audited action is also appended to the tamper-evident trail.
+  recordAuditEvent({ eventType: action, actor: user, contractId, payload: cleanDetails ?? {} });
+  recordContractStateChange(contractId, action);
 }

@@ -5,6 +5,8 @@ import { buildAndRecordTransaction } from "./_shared.js";
 import { deduplicationMiddleware, idempotencyMiddleware } from "../idempotency.js";
 import {
   recordDistributeCall,
+  recordDistributionLatency,
+  recordDistributionOutcomeMetric,
   recordTransactionFailure,
   recordTransactionSuccess,
 } from "../metrics.js";
@@ -45,6 +47,7 @@ distributeRouter.post(
       logger.info("distribution started", { contractId, walletAddress, tokenId });
 
       // Use shared handler to record transaction, build XDR, and log audit
+      const buildStart = Date.now();
       const { xdr, transactionId } = await buildAndRecordTransaction({
         contractId,
         walletAddress,
@@ -56,6 +59,8 @@ distributeRouter.post(
       });
 
       recordTransactionSuccess();
+      recordDistributionLatency("build", Date.now() - buildStart);
+      recordDistributionOutcomeMetric("built");
       // Invalidate cached history and contract state so the new distribution
       // appears immediately on subsequent reads.
       invalidateContract(contractId);

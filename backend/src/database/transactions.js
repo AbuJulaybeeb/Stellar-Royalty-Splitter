@@ -4,6 +4,8 @@
  */
 
 import { db, countWrite } from "./core.js";
+import { recordCollaboratorPayout } from "../metrics.js";
+import { recordAuditEvent } from "../services/audit-trail.js";
 
 /**
  * Exponential backoff delays in milliseconds for each retry attempt.
@@ -23,6 +25,12 @@ export function recordTransaction(contractId, type, initiatorAddress, data) {
 
   const result = stmt.run(contractId, type, initiatorAddress, requestedAmount, tokenId);
   countWrite();
+  recordAuditEvent({
+    eventType: "transaction_recorded",
+    actor: initiatorAddress,
+    contractId,
+    payload: { transactionId: result.lastInsertRowid, type, requestedAmount, tokenId, status: "pending" },
+  });
   return result.lastInsertRowid;
 }
 
@@ -35,6 +43,7 @@ export function updateTransactionHash(transactionId, txHash) {
 
   stmt.run(txHash, transactionId);
   countWrite();
+  recordAuditEvent({ eventType: "transaction_hash_linked", payload: { transactionId, txHash } });
 }
 
 export function updateTransactionStatus(txHash, status, blockTime = null, errorMessage = null) {
@@ -46,6 +55,10 @@ export function updateTransactionStatus(txHash, status, blockTime = null, errorM
 
   stmt.run(status, blockTime, errorMessage, txHash);
   countWrite();
+  recordAuditEvent({
+    eventType: "transaction_status_changed",
+    payload: { txHash, status, blockTime, errorMessage },
+  });
 }
 
 export function addDistributionPayout(
@@ -62,6 +75,13 @@ export function addDistributionPayout(
 
   stmt.run(transactionId, contractId, collaboratorAddress, amountReceived);
   countWrite();
+  recordCollaboratorPayout(contractId, collaboratorAddress, amountReceived);
+  recordAuditEvent({
+    eventType: "distribution_payout_recorded",
+    actor: collaboratorAddress,
+    contractId,
+    payload: { transactionId, amountReceived },
+  });
 }
 
 export function getTransactionCount(contractId, filters = {}) {

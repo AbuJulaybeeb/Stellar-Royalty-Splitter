@@ -26,6 +26,7 @@ import { sendError } from "../error-response.js";
 import { pollHorizonTransaction } from "../stellar.js";
 import { deliverDistributeWebhooks } from "../webhook-delivery.js";
 import logger from "../logger.js";
+import { recordDistributionLatency, recordDistributionOutcomeMetric } from "../metrics.js";
 import { cacheSet, cacheKey, TTL } from "../cache.js";
 
 const router = express.Router();
@@ -276,6 +277,14 @@ router.get("/transaction/:txHash", (req, res) => {
   }
 });
 
+// SQLite CURRENT_TIMESTAMP is UTC without a zone suffix ("YYYY-MM-DD HH:MM:SS").
+function parseSqliteTimestamp(value) {
+  if (typeof value !== "string" || !value) return null;
+  const iso = value.includes("T") ? value : value.replace(" ", "T");
+  const ms = Date.parse(/[zZ]|[+-]\d\d:?\d\d$/.test(iso) ? iso : `${iso}Z`);
+  return Number.isFinite(ms) ? ms : null;
+}
+
 /**
  * POST /api/transaction/confirm/:txHash
  * Poll Horizon for ledger confirmation (#297), update the DB, and fire
@@ -351,6 +360,14 @@ router.post("/transaction/confirm/:txHash", async (req, res) => {
     );
 
     const confirmed = getTransactionDetails(txHash);
+
+    if (existing.type === "distribute") {
+      recordDistributionOutcomeMetric(pollResult.status === "confirmed" ? "confirmed" : "failed");
+      const recordedAt = parseSqliteTimestamp(existing.timestamp);
+      if (pollResult.status === "confirmed" && recordedAt !== null) {
+        recordDistributionLatency("submission", Date.now() - recordedAt);
+      }
+    }
 
     if (pollResult.status === "confirmed" && confirmed?.type === "distribute") {
       deliverDistributeWebhooks(confirmed);

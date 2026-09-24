@@ -138,6 +138,138 @@ const alertsTriggered = new client.Counter({
   registers: [register],
 });
 
+// ── Distribution & royalty metrics for the Grafana dashboards (#935) ────────
+
+// Latency per distribution phase. "simulation" is the Soroban dry run behind
+// /simulate, "build" is recording + preparing the unsigned XDR, and
+// "submission" is wall-clock time from the transaction being recorded to its
+// on-chain confirmation (observed by /transaction/confirm).
+const distributionLatency = new client.Histogram({
+  name: "stellar_distribution_latency_seconds",
+  help: "Distribution latency by phase (simulation, build, submission)",
+  labelNames: ["phase"],
+  buckets: [0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, 120, 300],
+  registers: [register],
+});
+
+// Soroban resource fee reported by simulation — the network's "gas" for a
+// distribute call, in stroops.
+const distributionGas = new client.Histogram({
+  name: "stellar_distribution_gas_stroops",
+  help: "Simulated resource fee (stroops) per distribution",
+  buckets: [100, 1000, 10000, 50000, 100000, 250000, 500000, 1000000, 5000000, 10000000],
+  registers: [register],
+});
+
+const distributionsTotal = new client.Counter({
+  name: "stellar_distributions_total",
+  help: "Distributions by outcome (built, confirmed, failed)",
+  labelNames: ["outcome"],
+  registers: [register],
+});
+
+const secondarySaleProcessing = new client.Histogram({
+  name: "stellar_secondary_sale_processing_seconds",
+  help: "Time to process a secondary sale (rate lookup, persistence, XDR build)",
+  buckets: [0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10],
+  registers: [register],
+});
+
+const secondaryRoyaltyAccrued = new client.Counter({
+  name: "stellar_secondary_royalty_accrued_total",
+  help: "Secondary-sale royalties accrued into the pool (stroops)",
+  labelNames: ["contractId"],
+  registers: [register],
+});
+
+const secondaryRoyaltyDistributed = new client.Counter({
+  name: "stellar_secondary_royalty_distributed_total",
+  help: "Secondary royalties distributed out of the pool (stroops)",
+  labelNames: ["contractId"],
+  registers: [register],
+});
+
+// The pool balance is read from the database at scrape time rather than
+// derived from the counters above, so it stays correct across restarts.
+let secondaryRoyaltyPoolSource = null;
+new client.Gauge({
+  name: "stellar_secondary_royalty_pool_pending",
+  help: "Undistributed secondary royalties currently in the pool (stroops)",
+  labelNames: ["contractId"],
+  registers: [register],
+  collect() {
+    this.reset();
+    if (!secondaryRoyaltyPoolSource) return;
+    try {
+      for (const { contractId, pending } of secondaryRoyaltyPoolSource()) {
+        const value = Number(pending);
+        if (contractId && Number.isFinite(value)) this.set({ contractId }, value);
+      }
+    } catch {
+      // A failed DB read must never break the whole /metrics scrape.
+    }
+  },
+});
+
+// Collaborator addresses are unbounded, so the label set is capped; payouts to
+// collaborators beyond the cap are aggregated under "other".
+const MAX_COLLABORATOR_SERIES = parseInt(process.env.METRICS_MAX_COLLABORATOR_SERIES ?? "500", 10);
+const trackedCollaborators = new Set();
+
+const collaboratorEarnings = new client.Counter({
+  name: "stellar_collaborator_earnings_total",
+  help: "Amount paid out to collaborators (stroops)",
+  labelNames: ["contractId", "collaborator"],
+  registers: [register],
+});
+
+const collaboratorPayouts = new client.Counter({
+  name: "stellar_collaborator_payouts_total",
+  help: "Number of payouts made to collaborators",
+  labelNames: ["contractId", "collaborator"],
+  registers: [register],
+});
+
+const contractStateChanges = new client.Counter({
+  name: "stellar_contract_state_changes_total",
+  help: "Contract state changes recorded in the audit trail, by action",
+  labelNames: ["contractId", "action"],
+  registers: [register],
+});
+
+// ── Immutable audit trail (#938) ───────────────────────────────────────────
+
+const auditTrailIntegrity = new client.Gauge({
+  name: "stellar_audit_trail_integrity_ok",
+  help: "1 when the last audit-trail hash-chain verification passed, 0 when it failed",
+  registers: [register],
+});
+
+const auditTrailVerifications = new client.Counter({
+  name: "stellar_audit_trail_verifications_total",
+  help: "Audit-trail integrity verifications by result",
+  labelNames: ["result"],
+  registers: [register],
+});
+
+const auditTrailLastVerified = new client.Gauge({
+  name: "stellar_audit_trail_last_verified_timestamp_seconds",
+  help: "Unix time of the last completed audit-trail verification",
+  registers: [register],
+});
+
+const auditTrailEntries = new client.Gauge({
+  name: "stellar_audit_trail_entries",
+  help: "Entries currently held in the immutable audit trail",
+  registers: [register],
+});
+
+const auditTrailWriteFailures = new client.Counter({
+  name: "stellar_audit_trail_write_failures_total",
+  help: "State changes that could not be appended to the immutable audit trail",
+  registers: [register],
+});
+
 // Alerting constants
 const ALERT_WINDOW_MS = 5 * 60 * 1000;
 const ALERT_HISTORY_MS = 60 * 60 * 1000;
@@ -577,7 +709,79 @@ export function resetMetrics() {
   metrics.healthCheckTotal = 0;
   contractMetrics.clear();
   alertState.clear();
+  trackedCollaborators.clear();
   register.resetMetrics();
+}
+
+// ── #935 recorders ─────────────────────────────────────────────────────────
+
+function toFiniteNumber(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+/** @param {"simulation"|"build"|"submission"} phase */
+export function recordDistributionLatency(phase, durationMs) {
+  if (!Number.isFinite(durationMs) || durationMs < 0) return;
+  distributionLatency.observe({ phase }, durationMs / 1000);
+}
+
+export function recordDistributionGas(feeStroops) {
+  const fee = toFiniteNumber(feeStroops);
+  if (fee === null || fee < 0) return;
+  distributionGas.observe(fee);
+}
+
+/** @param {"built"|"confirmed"|"failed"} outcome */
+export function recordDistributionOutcomeMetric(outcome) {
+  distributionsTotal.inc({ outcome });
+}
+
+export function recordSecondarySaleProcessing(durationMs) {
+  if (!Number.isFinite(durationMs) || durationMs < 0) return;
+  secondarySaleProcessing.observe(durationMs / 1000);
+}
+
+export function recordSecondaryRoyaltyAccrued(contractId, amount) {
+  const value = toFiniteNumber(amount);
+  if (!contractId || value === null || value <= 0) return;
+  secondaryRoyaltyAccrued.inc({ contractId }, value);
+}
+
+export function recordSecondaryRoyaltyDistributed(contractId, amount) {
+  const value = toFiniteNumber(amount);
+  if (!contractId || value === null || value <= 0) return;
+  secondaryRoyaltyDistributed.inc({ contractId }, value);
+}
+
+/**
+ * Register the function the pool gauge reads at scrape time. It must return
+ * an array of `{ contractId, pending }`.
+ */
+export function setSecondaryRoyaltyPoolSource(fn) {
+  secondaryRoyaltyPoolSource = typeof fn === "function" ? fn : null;
+}
+
+export function recordCollaboratorPayout(contractId, collaborator, amount) {
+  const value = toFiniteNumber(amount);
+  if (!contractId || !collaborator || value === null || value < 0) return;
+  let label = collaborator;
+  if (!trackedCollaborators.has(collaborator)) {
+    if (trackedCollaborators.size < MAX_COLLABORATOR_SERIES) {
+      trackedCollaborators.add(collaborator);
+    } else {
+      label = "other";
+    }
+  }
+  const labels = { contractId, collaborator: label };
+  collaboratorPayouts.inc(labels);
+  collaboratorEarnings.inc(labels, value);
+}
+
+export function recordContractStateChange(contractId, action) {
+  if (!contractId || !action) return;
+  contractStateChanges.inc({ contractId, action });
 }
 
 // New comprehensive metrics functions (#816)
@@ -615,4 +819,39 @@ export function recordRateLimitHit(dimension) {
 
 export function setActiveConnections(count) {
   activeConnections.set(count);
+}
+
+// ── #938 recorders ─────────────────────────────────────────────────────────
+
+export function recordAuditTrailVerification({ ok, entriesChecked }) {
+  auditTrailIntegrity.set(ok ? 1 : 0);
+  auditTrailVerifications.inc({ result: ok ? "pass" : "fail" });
+  auditTrailLastVerified.set(Date.now() / 1000);
+  if (Number.isFinite(entriesChecked)) auditTrailEntries.set(entriesChecked);
+}
+
+export function recordAuditTrailWriteFailure() {
+  auditTrailWriteFailures.inc();
+}
+
+// ── #936 traffic shadowing ─────────────────────────────────────────────────
+
+const shadowRequests = new client.Counter({
+  name: "stellar_shadow_requests_total",
+  help: "Requests mirrored to the canary, by whether its status class matched the primary response",
+  labelNames: ["result"],
+  registers: [register],
+});
+
+const shadowLatency = new client.Histogram({
+  name: "stellar_shadow_request_duration_seconds",
+  help: "Latency of mirrored requests against the canary",
+  buckets: [0.01, 0.05, 0.1, 0.25, 0.5, 1, 2, 5],
+  registers: [register],
+});
+
+/** @param {"match"|"mismatch"|"error"} result */
+export function recordShadowRequest(result, durationMs) {
+  shadowRequests.inc({ result });
+  if (Number.isFinite(durationMs) && durationMs >= 0) shadowLatency.observe(durationMs / 1000);
 }

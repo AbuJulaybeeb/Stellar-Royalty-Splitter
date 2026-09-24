@@ -68,6 +68,12 @@ import { startFinalityCleanupScheduler } from "./jobs/finality-cleanup-job.js";
 import { startPaymentScheduleJob } from "./jobs/payment-schedule-job.js";
 import { setupGraphQL } from "./graphql.js";
 import { requestComplexityMiddleware } from "./request-complexity.js";
+import { auditTrailRouter } from "./routes/audit-trail.js";
+import { startAuditTrailVerifier, closeAuditTrail } from "./services/audit-trail.js";
+import { setSecondaryRoyaltyPoolSource } from "./metrics.js";
+import { httpMetricsMiddleware } from "./middleware/http-metrics.js";
+import { createTrafficShadowMiddleware } from "./middleware/traffic-shadow.js";
+import { getPendingRoyaltyPools } from "./database/secondary-royalties.js";
 
 // Initialize database on startup
 initializeDatabase();
@@ -119,6 +125,12 @@ app.use((req, res, next) => {
     next();
   });
 });
+
+// HTTP request count + latency histograms (#935), also the canary's health signal (#936)
+app.use(httpMetricsMiddleware);
+
+// Mirror safe requests to the canary when SHADOW_TARGET_URL is set (#936)
+app.use(createTrafficShadowMiddleware());
 
 // Reject new incoming requests during graceful shutdown (#701)
 app.use(shutdownMiddleware);
@@ -404,6 +416,7 @@ const adminLimiter = rateLimit({
   },
 });
 app.use("/admin", adminLimiter);
+app.use("/admin/audit-trail", auditTrailRouter);
 app.use("/admin", adminRouter);
 app.use("/admin/api-keys", adminLimiter);
 app.use("/admin/api-keys", adminApiKeysRouter);
@@ -446,6 +459,12 @@ async function startServer() {
 
   const metricsPusher = createMetricsPusher();
   metricsPusher.start();
+
+  // #935: pool balance gauge reads the database at scrape time.
+  setSecondaryRoyaltyPoolSource(getPendingRoyaltyPools);
+
+  // #938: periodic hash-chain verification + retention enforcement.
+  const auditTrailVerifier = startAuditTrailVerifier();
 
   // Start weekly email digest scheduler if email is configured
   let digestInterval = null;
@@ -497,6 +516,10 @@ async function startServer() {
         paymentScheduleJob.stop();
       }
       metricsPusher.stop();
+      if (auditTrailVerifier) {
+        auditTrailVerifier.stop();
+      }
+      closeAuditTrail();
     },
   });
 
