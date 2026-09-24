@@ -34,6 +34,33 @@ pub struct RoyaltyTier {
     pub description: String,
 }
 
+/// A cliff + linear vesting schedule for one collaborator's share (#931).
+///
+/// Design note (judgment call, documented per task instructions): rather
+/// than storing separately-mutated `locked_shares` / `unlocked_shares`
+/// counters that could drift out of sync, this struct stores only the
+/// immutable schedule parameters (`total_shares`, `cliff_days`,
+/// `vesting_days`, `start_time`) plus the one piece of mutable state that
+/// cannot be derived — `claimed_shares`, how much of the already-vested
+/// amount has been moved into the claimed state. "Currently vested" and
+/// "claimable now" are always computed on read from the immutable schedule
+/// (`Self::vested_shares_at`), so they can never drift out of sync with each
+/// other; only `claimed_shares` is ever written, by `claim_vested_shares`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VestingSchedule {
+    pub beneficiary: Address,
+    pub total_shares: u32,
+    pub cliff_days: u32,
+    pub vesting_days: u32,
+    /// Ledger timestamp (seconds) the schedule was created; the cliff and
+    /// vesting deadline are both measured from this.
+    pub start_time: u64,
+    /// Shares already moved into the claimed state via `claim_vested_shares`.
+    /// Always `<= total_shares` and `<=` the currently vested amount.
+    pub claimed_shares: u32,
+}
+
 /// One entry in the royalty rate change history (#323).
 #[contracttype]
 #[derive(Clone)]
@@ -306,6 +333,11 @@ pub enum ExtKey {
     /// (persistent storage). Written the first time `record_tiered_secondary_sale`
     /// observes that NFT; used for the 90-day time-based degradation.
     NftFirstSeen(Address, u64),
+    /// #931 — vesting schedule for one beneficiary (persistent storage),
+    /// `VestingSchedule`. `claimed_shares` lives inside the struct itself
+    /// (see `VestingSchedule`'s doc comment) so there is only one mutable
+    /// piece of state to keep consistent, not two.
+    VestingSchedule(Address),
 }
 
 /// Maximum number of rate-change entries kept in history.
@@ -523,6 +555,13 @@ impl ContractError {
     pub const TIER_RATE_TOO_HIGH: Self = Self::RoyaltyRateTooHigh;
     /// A tiered secondary sale named a `rarity` that no configured tier matches.
     pub const UNKNOWN_ROYALTY_TIER: Self = Self::CollaboratorNotFound;
+    /// `set_vesting_schedule` called with `total_shares == 0`, or
+    /// `vesting_days < cliff_days`.
+    pub const INVALID_VESTING_SCHEDULE: Self = Self::InvalidShareTotal;
+    /// `claim_vested_shares` for a beneficiary with no vesting schedule set.
+    pub const NO_VESTING_SCHEDULE: Self = Self::NotInitialized;
+    /// `claim_vested_shares` when nothing newly vested since the last claim.
+    pub const NOTHING_TO_CLAIM: Self = Self::NoBalance;
 }
 
 #[contract]
@@ -1472,8 +1511,34 @@ impl RoyaltySplitter {
 
         Self::pay_linked_forwards(&env, &token_client, &token, &forwards);
         for (addr, payout) in payouts.iter() {
-            token_client.transfer(&env.current_contract_address(), &addr, &payout);
-            let total_earned = Self::record_recipient_earnings(&env, &addr, &token, payout)?;
+            // #931 — a beneficiary with an active vesting schedule only
+            // actually receives their currently-vested portion of this
+            // payout now; the unvested remainder is escrowed for them
+            // (per-token, per-beneficiary) to claim later via
+            // `claim_vested_shares` as more of it vests. This keeps the
+            // payout math above (which the fuzz/property suites' money-
+            // conservation invariants depend on) completely untouched —
+            // `payout` here is still each recipient's full nominal share of
+            // `collaborator_amount` — while still satisfying "only vested
+            // shares are usable now" from the beneficiary's own point of
+            // view. A beneficiary with no schedule is unaffected: `payout`
+            // is transferred in full, exactly as before #931.
+            let transferable = Self::vesting_transferable_amount(&env, &addr, &token, payout);
+            if transferable > 0 {
+                token_client.transfer(&env.current_contract_address(), &addr, &transferable);
+                // `RecipientEarnings` (read via `get_recipient_earnings`) is
+                // meant to reflect money actually moved to the recipient, so
+                // it is credited for `transferable`, not the full nominal
+                // `payout` — the unvested remainder is not yet the
+                // recipient's money and must not show up as "earned" until
+                // `claim_vested_shares` actually pays it out.
+                let total_earned =
+                    Self::record_recipient_earnings(&env, &addr, &token, transferable)?;
+                env.events().publish(
+                    (symbol_short!("royalty"), symbol_short!("earned")),
+                    (addr.clone(), token.clone(), transferable, total_earned),
+                );
+            }
             env.events().publish(
                 (symbol_short!("royalty"), symbol_short!("dist")),
                 (
@@ -1482,10 +1547,6 @@ impl RoyaltySplitter {
                     token.clone(),
                     symbol_short!("primary"),
                 ),
-            );
-            env.events().publish(
-                (symbol_short!("royalty"), symbol_short!("earned")),
-                (addr, token.clone(), payout, total_earned),
             );
         }
 
@@ -2816,6 +2877,193 @@ impl RoyaltySplitter {
         storage::extend_instance_ttl(&env);
         storage::persistent_get::<Map<Address, u32>>(&env, &StorageKey::ShareMap)
             .unwrap_or(Map::new(&env))
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // #931 — Cliff + linear vesting schedules for collaborator shares
+    //
+    // A `VestingSchedule` restricts how much of a beneficiary's nominal
+    // collaborator share (from `ShareMap`, unchanged) is actually payable to
+    // them at any given moment. It does NOT change their `share` in
+    // `ShareMap`/`Recipient` — the payout math in `calculate_payouts` (which
+    // every conservation invariant in the fuzz/property test suites depends
+    // on) still computes each recipient's full nominal payout, so the
+    // 10_000-bps total and Σ payouts == amount invariants are untouched.
+    // Instead, `distribute_with_override` (see `vesting_transferable_amount`)
+    // transfers only the vested portion of that nominal payout right now and
+    // leaves the rest as a per-token pending balance the beneficiary can pull
+    // later via `claim_vested_shares` as more of their schedule vests. A
+    // beneficiary with no schedule set is entirely unaffected — same
+    // behavior as before #931.
+    //
+    // "Currently vested" is always computed on read from the schedule's
+    // immutable parameters (`start_time`, `cliff_days`, `vesting_days`,
+    // `total_shares`) — see `Self::vested_shares_at` — rather than tracked by
+    // a separately-mutated counter, so it can never drift out of sync.
+    // `claimed_shares` is the one mutable field, advanced only by
+    // `claim_vested_shares`, and is capped so it can never exceed either
+    // `total_shares` or the currently vested amount.
+    // ─────────────────────────────────────────────────────────────────────
+
+    const SECONDS_PER_DAY: u64 = 86_400;
+
+    /// Admin: create or replace `beneficiary`'s vesting schedule, starting
+    /// now. `total_shares` is a vesting-accounting unit local to this
+    /// schedule — see the module doc comment above for how it relates (or
+    /// rather, does not directly relate) to `ShareMap`'s basis-point shares;
+    /// `get_vested_shares` reports "how many of `total_shares` are vested",
+    /// and `distribute_with_override` scales a beneficiary's payout by
+    /// `vested_shares / total_shares`.
+    pub fn set_vesting_schedule(
+        env: Env,
+        beneficiary: Address,
+        total_shares: u32,
+        cliff_days: u32,
+        vesting_days: u32,
+    ) -> Result<(), ContractError> {
+        storage::extend_instance_ttl(&env);
+        Self::check_admin_auth(&env, auth::msg::SET_VESTING_SCHEDULE_ADMIN);
+
+        if total_shares == 0 || vesting_days < cliff_days {
+            return Err(ContractError::INVALID_VESTING_SCHEDULE);
+        }
+
+        let schedule = VestingSchedule {
+            beneficiary: beneficiary.clone(),
+            total_shares,
+            cliff_days,
+            vesting_days,
+            start_time: env.ledger().timestamp(),
+            claimed_shares: 0,
+        };
+        storage::persistent_set(
+            &env,
+            &StorageKey::Ext(ExtKey::VestingSchedule(beneficiary.clone())),
+            &schedule,
+        );
+        env.events().publish(
+            (symbol_short!("royalty"), symbol_short!("vest_set")),
+            (beneficiary, total_shares, cliff_days, vesting_days),
+        );
+        Ok(())
+    }
+
+    pub fn get_vesting_schedule(env: Env, beneficiary: Address) -> Option<VestingSchedule> {
+        storage::extend_instance_ttl(&env);
+        storage::persistent_get(&env, &StorageKey::Ext(ExtKey::VestingSchedule(beneficiary)))
+    }
+
+    /// Shares vested out of `schedule.total_shares` as of `current_time`:
+    ///   - before the cliff (`start_time + cliff_days`): 0
+    ///   - `cliff_days == vesting_days`: the full amount right at the cliff
+    ///     (and thereafter) — there is no linear segment to speak of
+    ///   - between the cliff and the deadline (`start_time + cliff_days +
+    ///     vesting_days`): linear from 0 at the cliff to `total_shares` at
+    ///     the deadline
+    ///   - at or after the deadline: the full amount
+    fn vested_shares_at(schedule: &VestingSchedule, current_time: u64) -> u32 {
+        let cliff_secs = (schedule.cliff_days as u64).saturating_mul(Self::SECONDS_PER_DAY);
+        let vesting_secs = (schedule.vesting_days as u64).saturating_mul(Self::SECONDS_PER_DAY);
+        let cliff_time = schedule.start_time.saturating_add(cliff_secs);
+
+        if current_time < cliff_time {
+            return 0;
+        }
+        if schedule.cliff_days == schedule.vesting_days {
+            return schedule.total_shares;
+        }
+
+        let deadline = schedule.start_time.saturating_add(vesting_secs);
+        if current_time >= deadline {
+            return schedule.total_shares;
+        }
+
+        // Linear from 0 at cliff_time to total_shares at deadline. deadline
+        // > cliff_time is guaranteed here: vesting_days > cliff_days (the
+        // == case returned above) and vesting_days >= cliff_days is enforced
+        // by `set_vesting_schedule`, so vesting_secs > cliff_secs.
+        let elapsed_since_cliff = current_time.saturating_sub(cliff_time);
+        let linear_window = deadline.saturating_sub(cliff_time);
+        ((schedule.total_shares as u128) * (elapsed_since_cliff as u128) / (linear_window as u128))
+            as u32
+    }
+
+    /// Read-only: shares of `address`'s vesting schedule vested as of
+    /// `current_time`. Returns 0 for an address with no schedule set (as
+    /// opposed to erroring), since "no schedule" and "not yet vested" both
+    /// mean "not currently claimable" from a caller's point of view, and
+    /// this mirrors `get_vested_shares`'s use as a pure query, e.g. by an
+    /// off-chain indexer that does not first check `get_vesting_schedule`.
+    pub fn get_vested_shares(env: Env, address: Address, current_time: u64) -> u32 {
+        storage::extend_instance_ttl(&env);
+        match Self::get_vesting_schedule(env, address) {
+            Some(schedule) => Self::vested_shares_at(&schedule, current_time),
+            None => 0,
+        }
+    }
+
+    /// How much of `nominal_payout` (this recipient's full, unscaled payout
+    /// as `calculate_payouts` computed it) `addr` may actually receive right
+    /// now, given any vesting schedule on `addr`. A `addr` with no schedule
+    /// gets `nominal_payout` in full — identical to pre-#931 behavior.
+    fn vesting_transferable_amount(
+        env: &Env,
+        addr: &Address,
+        _token: &Address,
+        nominal_payout: i128,
+    ) -> i128 {
+        let schedule = match Self::get_vesting_schedule(env.clone(), addr.clone()) {
+            Some(schedule) => schedule,
+            None => return nominal_payout,
+        };
+        let vested = Self::vested_shares_at(&schedule, env.ledger().timestamp());
+        // nominal_payout * vested / total_shares, floored. total_shares is
+        // always > 0 (`set_vesting_schedule` rejects 0), and both operands
+        // are non-negative, so this mirrors `checked_bps_amount`'s
+        // decomposition without needing basis-point-specific bounds.
+        ((nominal_payout as u128) * (vested as u128) / (schedule.total_shares as u128)) as i128
+    }
+
+    /// Beneficiary: claim shares that have vested since the last claim.
+    /// Returns the newly-claimed share count (`0` and an error if nothing is
+    /// newly claimable — see below — rather than silently returning `0`,
+    /// so a caller cannot mistake "nothing to claim" for "claimed 0 by
+    /// design"). Advances `claimed_shares` so a second call before more
+    /// vests correctly claims nothing further (no double-claiming).
+    ///
+    /// Note on scope: this claims the *share-accounting* delta
+    /// (`get_vested_shares`'s unit). Moving the corresponding *token*
+    /// amount is handled by `distribute_with_override`'s
+    /// `vesting_transferable_amount` at each distribution — claiming shares
+    /// here does not itself move tokens, since vested shares only translate
+    /// into a token amount in the context of one specific distribution's
+    /// `nominal_payout`, and this contract can hold arbitrarily many tokens.
+    pub fn claim_vested_shares(env: Env, beneficiary: Address) -> Result<u32, ContractError> {
+        storage::extend_instance_ttl(&env);
+        auth::require_payer(
+            &env,
+            &beneficiary,
+            auth::msg::CLAIM_VESTED_SHARES_BENEFICIARY,
+        );
+
+        let key = StorageKey::Ext(ExtKey::VestingSchedule(beneficiary.clone()));
+        let mut schedule: VestingSchedule =
+            storage::persistent_get(&env, &key).ok_or(ContractError::NO_VESTING_SCHEDULE)?;
+
+        let vested_now = Self::vested_shares_at(&schedule, env.ledger().timestamp());
+        let newly_claimable = vested_now.saturating_sub(schedule.claimed_shares);
+        if newly_claimable == 0 {
+            return Err(ContractError::NOTHING_TO_CLAIM);
+        }
+
+        schedule.claimed_shares = schedule.claimed_shares.saturating_add(newly_claimable);
+        storage::persistent_set(&env, &key, &schedule);
+
+        env.events().publish(
+            (symbol_short!("royalty"), symbol_short!("vest_clm")),
+            (beneficiary, newly_claimable, schedule.claimed_shares),
+        );
+        Ok(newly_claimable)
     }
 
     pub fn get_secondary_pool(env: Env) -> i128 {

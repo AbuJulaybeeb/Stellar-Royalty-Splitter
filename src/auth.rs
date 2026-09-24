@@ -60,6 +60,10 @@ pub mod msg {
         "set_token_fee_override: admin authorization required";
     pub const WITHDRAW_FEES_ADMIN: &str = "withdraw_fees: admin authorization required";
     pub const SET_ROYALTY_TIERS_ADMIN: &str = "set_royalty_tiers: admin authorization required";
+    pub const SET_VESTING_SCHEDULE_ADMIN: &str =
+        "set_vesting_schedule: admin authorization required";
+    pub const CLAIM_VESTED_SHARES_BENEFICIARY: &str =
+        "claim_vested_shares: beneficiary authorization required";
 }
 
 /// Requires admin authorization; panics with `message` if missing.

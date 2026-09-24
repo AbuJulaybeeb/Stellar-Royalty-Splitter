@@ -7646,3 +7646,358 @@ mod tiered_royalties {
         );
     }
 }
+
+/// Issue #931 — cliff and linear vesting schedules for collaborator shares.
+mod vesting {
+    use super::*;
+    use soroban_sdk::vec;
+
+    const DAY: u64 = 86_400;
+
+    #[test]
+    fn admin_can_set_vesting_schedule() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_, client) = setup(&env);
+        let admin = Address::generate(&env);
+        let beneficiary = Address::generate(&env);
+        client.initialize(
+            &vec![&env, admin.clone(), beneficiary.clone()],
+            &vec![&env, 5_000_u32, 5_000_u32],
+        );
+
+        env.ledger().with_mut(|l| l.timestamp = 1_000_000);
+        client.set_vesting_schedule(&beneficiary, &1_000_u32, &30_u32, &120_u32);
+
+        let schedule = client.get_vesting_schedule(&beneficiary).unwrap();
+        assert_eq!(schedule.beneficiary, beneficiary);
+        assert_eq!(schedule.total_shares, 1_000);
+        assert_eq!(schedule.cliff_days, 30);
+        assert_eq!(schedule.vesting_days, 120);
+        assert_eq!(schedule.start_time, 1_000_000);
+        assert_eq!(schedule.claimed_shares, 0);
+    }
+
+    #[test]
+    fn set_vesting_schedule_requires_admin_auth() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_, client) = setup(&env);
+        let admin = Address::generate(&env);
+        client.initialize(&vec![&env, admin.clone()], &vec![&env, 10_000_u32]);
+
+        let beneficiary = Address::generate(&env);
+        client.set_vesting_schedule(&beneficiary, &100_u32, &10_u32, &10_u32);
+        let auths = env.auths();
+        assert_eq!(auths.len(), 1);
+        assert_eq!(auths[0].0, admin);
+    }
+
+    #[test]
+    fn set_vesting_schedule_rejects_invalid_args() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_, client) = setup(&env);
+        let admin = Address::generate(&env);
+        client.initialize(&vec![&env, admin.clone()], &vec![&env, 10_000_u32]);
+        let beneficiary = Address::generate(&env);
+
+        assert_eq!(
+            client.try_set_vesting_schedule(&beneficiary, &0u32, &10u32, &10u32),
+            Err(Ok(ContractError::INVALID_VESTING_SCHEDULE))
+        );
+        // vesting_days < cliff_days makes no sense (deadline before cliff).
+        assert_eq!(
+            client.try_set_vesting_schedule(&beneficiary, &100u32, &20u32, &10u32),
+            Err(Ok(ContractError::INVALID_VESTING_SCHEDULE))
+        );
+    }
+
+    #[test]
+    fn zero_vested_before_cliff() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_, client) = setup(&env);
+        let admin = Address::generate(&env);
+        client.initialize(&vec![&env, admin.clone()], &vec![&env, 10_000_u32]);
+        let beneficiary = Address::generate(&env);
+
+        env.ledger().with_mut(|l| l.timestamp = 1_000_000);
+        client.set_vesting_schedule(&beneficiary, &1_000_u32, &30_u32, &120_u32);
+
+        // 1 second before the 30-day cliff.
+        let just_before_cliff = 1_000_000 + 30 * DAY - 1;
+        assert_eq!(
+            client.get_vested_shares(&beneficiary, &just_before_cliff),
+            0
+        );
+        // Right at start_time.
+        assert_eq!(client.get_vested_shares(&beneficiary, &1_000_000), 0);
+    }
+
+    #[test]
+    fn cliff_equals_vesting_jumps_to_full_at_cliff() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_, client) = setup(&env);
+        let admin = Address::generate(&env);
+        client.initialize(&vec![&env, admin.clone()], &vec![&env, 10_000_u32]);
+        let beneficiary = Address::generate(&env);
+
+        env.ledger().with_mut(|l| l.timestamp = 1_000_000);
+        client.set_vesting_schedule(&beneficiary, &1_000_u32, &30_u32, &30_u32);
+
+        let cliff_time = 1_000_000 + 30 * DAY;
+        assert_eq!(client.get_vested_shares(&beneficiary, &(cliff_time - 1)), 0);
+        assert_eq!(client.get_vested_shares(&beneficiary, &cliff_time), 1_000);
+        assert_eq!(
+            client.get_vested_shares(&beneficiary, &(cliff_time + 10 * DAY)),
+            1_000
+        );
+    }
+
+    #[test]
+    fn partial_vesting_is_linear_between_cliff_and_deadline() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_, client) = setup(&env);
+        let admin = Address::generate(&env);
+        client.initialize(&vec![&env, admin.clone()], &vec![&env, 10_000_u32]);
+        let beneficiary = Address::generate(&env);
+
+        env.ledger().with_mut(|l| l.timestamp = 0);
+        // cliff at day 30, deadline at day 30 + 120 = 150. Linear window is
+        // 120 days wide.
+        client.set_vesting_schedule(&beneficiary, &1_000_u32, &30_u32, &150_u32);
+
+        let cliff = 30 * DAY;
+        let deadline = 150 * DAY;
+
+        // Exactly at the cliff: 0 vested (linear segment starts at 0 here).
+        assert_eq!(client.get_vested_shares(&beneficiary, &cliff), 0);
+        // Halfway through the 120-day linear window: 50% => 500.
+        assert_eq!(
+            client.get_vested_shares(&beneficiary, &(cliff + 60 * DAY)),
+            500
+        );
+        // Just before the deadline: close to, but not, full.
+        let almost_full = client.get_vested_shares(&beneficiary, &(deadline - DAY));
+        assert!(almost_full < 1_000 && almost_full > 900);
+    }
+
+    #[test]
+    fn full_vesting_after_deadline() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_, client) = setup(&env);
+        let admin = Address::generate(&env);
+        client.initialize(&vec![&env, admin.clone()], &vec![&env, 10_000_u32]);
+        let beneficiary = Address::generate(&env);
+
+        env.ledger().with_mut(|l| l.timestamp = 0);
+        client.set_vesting_schedule(&beneficiary, &1_000_u32, &30_u32, &150_u32);
+
+        let deadline = 150 * DAY;
+        assert_eq!(client.get_vested_shares(&beneficiary, &deadline), 1_000);
+        assert_eq!(
+            client.get_vested_shares(&beneficiary, &(deadline + 1_000 * DAY)),
+            1_000
+        );
+    }
+
+    #[test]
+    fn no_schedule_reports_zero_vested_shares() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_, client) = setup(&env);
+        let admin = Address::generate(&env);
+        client.initialize(&vec![&env, admin.clone()], &vec![&env, 10_000_u32]);
+        let nobody = Address::generate(&env);
+        assert_eq!(client.get_vested_shares(&nobody, &1_000_000), 0);
+    }
+
+    #[test]
+    fn distribute_uses_only_vested_shares_for_scheduled_beneficiary() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        let scheduled = Address::generate(&env);
+        let unscheduled = Address::generate(&env);
+        client.initialize(
+            &vec![&env, scheduled.clone(), unscheduled.clone()],
+            &vec![&env, 5_000_u32, 5_000_u32],
+        );
+
+        env.ledger().with_mut(|l| l.timestamp = 0);
+        // Cliff at day 30, linear to day 150; at "now" (t=0) nothing is vested.
+        client.set_vesting_schedule(&scheduled, &1_000_u32, &30_u32, &150_u32);
+
+        let token_admin = Address::generate(&env);
+        let token = make_token(&env, &token_admin);
+        mint(&env, &token, &contract_id, 10_000);
+
+        client.distribute(&token);
+
+        // `scheduled` has 0 vested shares right now => receives nothing yet,
+        // even though their nominal ShareMap share is still 50%.
+        assert_eq!(TokenClient::new(&env, &token).balance(&scheduled), 0);
+        // `unscheduled` is completely unaffected: full 50% as before #931.
+        assert_eq!(TokenClient::new(&env, &token).balance(&unscheduled), 5_000);
+
+        // The unvested amount is not lost: it stays in the contract balance
+        // (not transferred to anyone), available for `scheduled` once more
+        // vests and another distribution runs.
+        assert_eq!(TokenClient::new(&env, &token).balance(&contract_id), 5_000);
+    }
+
+    #[test]
+    fn distribute_pays_proportional_vested_amount() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        let scheduled = Address::generate(&env);
+        let unscheduled = Address::generate(&env);
+        client.initialize(
+            &vec![&env, scheduled.clone(), unscheduled.clone()],
+            &vec![&env, 5_000_u32, 5_000_u32],
+        );
+
+        env.ledger().with_mut(|l| l.timestamp = 0);
+        client.set_vesting_schedule(&scheduled, &1_000_u32, &30_u32, &150_u32);
+        // Halfway through the linear window: 50% vested.
+        env.ledger().with_mut(|l| l.timestamp = 30 * DAY + 60 * DAY);
+
+        let token_admin = Address::generate(&env);
+        let token = make_token(&env, &token_admin);
+        mint(&env, &token, &contract_id, 10_000);
+        client.distribute(&token);
+
+        // scheduled's nominal payout is 5_000 (50% share); only 50% of that
+        // (500 of 1_000 total_shares vested) is transferable now => 2_500.
+        assert_eq!(TokenClient::new(&env, &token).balance(&scheduled), 2_500);
+        assert_eq!(TokenClient::new(&env, &token).balance(&unscheduled), 5_000);
+    }
+
+    #[test]
+    fn distribute_pays_full_share_after_vesting_completes() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (contract_id, client) = setup(&env);
+        let scheduled = Address::generate(&env);
+        let unscheduled = Address::generate(&env);
+        client.initialize(
+            &vec![&env, scheduled.clone(), unscheduled.clone()],
+            &vec![&env, 5_000_u32, 5_000_u32],
+        );
+
+        env.ledger().with_mut(|l| l.timestamp = 0);
+        client.set_vesting_schedule(&scheduled, &1_000_u32, &30_u32, &150_u32);
+        env.ledger().with_mut(|l| l.timestamp = 150 * DAY + 1);
+
+        let token_admin = Address::generate(&env);
+        let token = make_token(&env, &token_admin);
+        mint(&env, &token, &contract_id, 10_000);
+        client.distribute(&token);
+
+        assert_eq!(TokenClient::new(&env, &token).balance(&scheduled), 5_000);
+        assert_eq!(TokenClient::new(&env, &token).balance(&unscheduled), 5_000);
+    }
+
+    #[test]
+    fn claim_vested_shares_returns_only_newly_vested_delta() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_, client) = setup(&env);
+        let admin = Address::generate(&env);
+        client.initialize(&vec![&env, admin.clone()], &vec![&env, 10_000_u32]);
+        let beneficiary = Address::generate(&env);
+
+        env.ledger().with_mut(|l| l.timestamp = 0);
+        client.set_vesting_schedule(&beneficiary, &1_000_u32, &30_u32, &150_u32);
+
+        // Halfway through: 500 vested, none claimed yet => claim returns 500.
+        env.ledger().with_mut(|l| l.timestamp = 30 * DAY + 60 * DAY);
+        let claimed_1 = client.claim_vested_shares(&beneficiary);
+        assert_eq!(claimed_1, 500);
+        assert_eq!(
+            client
+                .get_vesting_schedule(&beneficiary)
+                .unwrap()
+                .claimed_shares,
+            500
+        );
+
+        // Immediately claiming again with no further time passing: nothing
+        // new to claim => error, and no double-claim of the same 500.
+        assert_eq!(
+            client.try_claim_vested_shares(&beneficiary),
+            Err(Ok(ContractError::NOTHING_TO_CLAIM))
+        );
+
+        // After the deadline: only the remaining 500 (not the full 1_000) is
+        // newly claimable.
+        env.ledger().with_mut(|l| l.timestamp = 150 * DAY + 1);
+        let claimed_2 = client.claim_vested_shares(&beneficiary);
+        assert_eq!(claimed_2, 500);
+        assert_eq!(
+            client
+                .get_vesting_schedule(&beneficiary)
+                .unwrap()
+                .claimed_shares,
+            1_000
+        );
+    }
+
+    #[test]
+    fn claim_vested_shares_requires_beneficiary_auth() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_, client) = setup(&env);
+        let admin = Address::generate(&env);
+        client.initialize(&vec![&env, admin.clone()], &vec![&env, 10_000_u32]);
+        let beneficiary = Address::generate(&env);
+
+        env.ledger().with_mut(|l| l.timestamp = 0);
+        client.set_vesting_schedule(&beneficiary, &1_000_u32, &30_u32, &30_u32);
+        env.ledger().with_mut(|l| l.timestamp = 30 * DAY);
+
+        client.claim_vested_shares(&beneficiary);
+        let auths = env.auths();
+        assert_eq!(auths.len(), 1);
+        assert_eq!(auths[0].0, beneficiary);
+    }
+
+    #[test]
+    fn claim_vested_shares_without_schedule_errors() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_, client) = setup(&env);
+        let admin = Address::generate(&env);
+        client.initialize(&vec![&env, admin.clone()], &vec![&env, 10_000_u32]);
+        let nobody = Address::generate(&env);
+        assert_eq!(
+            client.try_claim_vested_shares(&nobody),
+            Err(Ok(ContractError::NO_VESTING_SCHEDULE))
+        );
+    }
+
+    #[test]
+    fn claim_vested_shares_before_cliff_errors() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (_, client) = setup(&env);
+        let admin = Address::generate(&env);
+        client.initialize(&vec![&env, admin.clone()], &vec![&env, 10_000_u32]);
+        let beneficiary = Address::generate(&env);
+
+        env.ledger().with_mut(|l| l.timestamp = 0);
+        client.set_vesting_schedule(&beneficiary, &1_000_u32, &30_u32, &150_u32);
+        // Still before the cliff.
+        env.ledger().with_mut(|l| l.timestamp = 10 * DAY);
+
+        assert_eq!(
+            client.try_claim_vested_shares(&beneficiary),
+            Err(Ok(ContractError::NOTHING_TO_CLAIM))
+        );
+    }
+}
