@@ -299,6 +299,29 @@ export {
   resetHealthMonitorState,
 } from "./health-monitor.js";
 
+// Salesforce CRM integration (#939)
+export {
+  CRM_PROVIDER,
+  CRM_SYNC_STATES,
+  CRM_ACTIVITY_STATES,
+  CRM_SYNC_DIRECTIONS,
+  getConnection,
+  saveConnection,
+  updateConnectionTokens,
+  disconnectConnection,
+  getSyncStatus,
+  startSync,
+  incrementSyncProgress,
+  finishSync,
+  getContactMappingByAddress,
+  findContactMappingByExternalId,
+  listContactMappings,
+  upsertContactMapping,
+  recordCrmActivity,
+  listCrmActivities,
+  listKnownCollaborators,
+} from "./crm-sync-status.js";
+
 // Default export for backwards compatibility
 import { db } from "./core.js";
 export default db;
