@@ -55,6 +55,7 @@ import { csvImportRouter } from "./routes/csv-import.js";
 import { contributorTaxRouter } from "./routes/contributor-tax.js";
 import { notificationsRouter } from "./routes/notifications.js";
 import { smsPreferencesRouter } from "./routes/notifications/sms.js";
+import { openseaRouter } from "./routes/marketplaces/opensea.js";
 import { paymentHoldsRouter } from "./routes/payment-holds.js";
 import { earningsHistoryRouter } from "./routes/earnings-history.js";
 import { versionRouter } from "./routes/version.js";
@@ -285,7 +286,19 @@ app.use((req, _res, next) => {
 
 // Global max request body size — configurable via env, defaults to prior hardcoded value.
 const MAX_REQUEST_BODY_SIZE = process.env.MAX_REQUEST_BODY_SIZE ?? "10kb";
-app.use(express.json({ limit: MAX_REQUEST_BODY_SIZE }));
+// `verify` stashes the raw request bytes on every request (cheap — the
+// buffer is already in memory from parsing). Routes that need to verify an
+// HMAC signature over the exact bytes the sender signed (e.g.
+// routes/marketplaces/opensea.js) read req.rawBody instead of re-serializing
+// req.body, which would not byte-for-byte match the original payload.
+app.use(
+  express.json({
+    limit: MAX_REQUEST_BODY_SIZE,
+    verify: (req, _res, buf) => {
+      req.rawBody = buf.toString("utf8");
+    },
+  })
+);
 
 // Attach X-API-Version header to all versioned responses
 app.use("/api/v1", (_req, res, next) => {
@@ -406,6 +419,10 @@ app.use("/api/v1/version", versionRouter);
 
 // Transaction finality tracking (#finality)
 app.use("/api/v1/transactions", transactionFinalityRouter);
+
+// OpenSea marketplace webhook integration (#928)
+app.use("/api/v1/marketplaces/opensea", writeLimiter);
+app.use("/api/v1/marketplaces/opensea", openseaRouter);
 
 // Admin operations (separate from /api/v1; protected by ADMIN_ROTATE_TOKEN)
 const RATE_LIMIT_ADMIN_WINDOW_MS = 60_000;

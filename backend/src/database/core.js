@@ -355,6 +355,35 @@ export function initializeDatabase() {
           CREATE INDEX IF NOT EXISTS idx_sms_send_log_created_at ON sms_send_log(createdAt);
         `,
     },
+    {
+      // #928: OpenSea marketplace webhook integration — event idempotency/
+      // audit trail + per-contract auto-recording toggle
+      version: 16,
+      sql: `
+          CREATE TABLE IF NOT EXISTS marketplace_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            provider TEXT NOT NULL,
+            eventId TEXT NOT NULL,
+            contractId TEXT NOT NULL,
+            nftId TEXT NOT NULL,
+            salePrice TEXT NOT NULL,
+            royaltyAmount TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'recorded',
+            rawPayload TEXT,
+            createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(provider, eventId)
+          );
+          CREATE INDEX IF NOT EXISTS idx_marketplace_events_contract ON marketplace_events(contractId);
+          CREATE INDEX IF NOT EXISTS idx_marketplace_events_created_at ON marketplace_events(createdAt);
+
+          CREATE TABLE IF NOT EXISTS marketplace_settings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            contractId TEXT NOT NULL UNIQUE,
+            autoRecordingEnabled INTEGER NOT NULL DEFAULT 1,
+            updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP
+          );
+        `,
+    },
   ];
 
   for (const migration of migrations) {
