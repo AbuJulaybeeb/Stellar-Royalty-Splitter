@@ -479,6 +479,80 @@ export function initializeDatabase() {
             ON stripe_webhook_events(eventType, createdAt DESC);
         `,
     },
+    {
+      version: 17,
+      sql: `
+        -- Marketplace webhook integrations — OpenSea (#928) and Rarible (#954).
+        --
+        -- src/database/marketplace-events.js talks to src/database/core.js, but
+        -- marketplace_events / marketplace_settings were never part of this
+        -- migration chain: on a database created through initializeDatabase()
+        -- (src/database/index.js) every marketplace webhook failed with
+        -- "no such table: marketplace_events" before it could record anything.
+        CREATE TABLE IF NOT EXISTS marketplace_events (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          provider TEXT NOT NULL,
+          eventId TEXT NOT NULL,
+          contractId TEXT NOT NULL,
+          nftId TEXT NOT NULL,
+          salePrice TEXT,
+          royaltyAmount TEXT,
+          status TEXT NOT NULL DEFAULT 'recorded',
+          rawPayload TEXT,
+          createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+          UNIQUE(provider, eventId)
+        );
+        CREATE INDEX IF NOT EXISTS idx_marketplace_events_contractId
+          ON marketplace_events(contractId, createdAt DESC);
+
+        -- Per-contract "marketplace auto-recording" toggle (#928), shared by
+        -- every marketplace provider.
+        CREATE TABLE IF NOT EXISTS marketplace_settings (
+          contractId TEXT PRIMARY KEY,
+          autoRecordingEnabled INTEGER NOT NULL DEFAULT 1,
+          updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+
+        -- The marketplace write path records the resale through
+        -- database/secondary-royalties.js (recordSecondarySale) and the audit
+        -- entry through database/audit.js (addAuditLog). Both tables are
+        -- currently defined only in the legacy src/database.js schema, which
+        -- the app no longer initialises, so they are created here too —
+        -- IF NOT EXISTS keeps this compatible with databases that already
+        -- have them from that schema.
+        CREATE TABLE IF NOT EXISTS secondary_sales (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          contractId TEXT NOT NULL,
+          nftId TEXT NOT NULL,
+          previousOwner TEXT NOT NULL,
+          newOwner TEXT NOT NULL,
+          salePrice TEXT NOT NULL,
+          saleToken TEXT NOT NULL,
+          royaltyAmount TEXT NOT NULL,
+          royaltyRate INTEGER NOT NULL,
+          distributed INTEGER NOT NULL DEFAULT 0,
+          timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+          transactionHash TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_secondary_sales_contractId ON secondary_sales(contractId);
+        CREATE INDEX IF NOT EXISTS idx_secondary_sales_nftId ON secondary_sales(nftId);
+        CREATE INDEX IF NOT EXISTS idx_secondary_sales_timestamp ON secondary_sales(timestamp);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_secondary_sales_dedup
+          ON secondary_sales(contractId, nftId, previousOwner, newOwner, salePrice, saleToken);
+
+        CREATE TABLE IF NOT EXISTS audit_log (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          contractId TEXT NOT NULL,
+          action TEXT NOT NULL,
+          user TEXT,
+          details TEXT,
+          timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_audit_contractId ON audit_log(contractId);
+        CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_log(timestamp);
+        CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_log(action);
+      `,
+    },
   ];
 
   for (const migration of migrations) {

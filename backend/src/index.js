@@ -79,6 +79,8 @@ import { httpMetricsMiddleware } from "./middleware/http-metrics.js";
 import { createTrafficShadowMiddleware } from "./middleware/traffic-shadow.js";
 import { getPendingRoyaltyPools } from "./database/secondary-royalties.js";
 import { initRedisCache } from "./cache.js";
+import { openseaRouter } from "./routes/marketplaces/opensea.js";
+import { raribleRouter } from "./routes/marketplaces/rarible.js";
 
 // Initialize database on startup
 initializeDatabase();
@@ -435,6 +437,10 @@ app.use("/api/v1/transactions", transactionFinalityRouter);
 // OpenSea marketplace webhook integration (#928)
 app.use("/api/v1/marketplaces/opensea", writeLimiter);
 app.use("/api/v1/marketplaces/opensea", openseaRouter);
+
+// Rarible marketplace webhook integration (#954)
+app.use("/api/v1/marketplaces/rarible", writeLimiter);
+app.use("/api/v1/marketplaces/rarible", raribleRouter);
 
 // Admin operations (separate from /api/v1; protected by ADMIN_ROTATE_TOKEN)
 const RATE_LIMIT_ADMIN_WINDOW_MS = 60_000;
