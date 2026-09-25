@@ -25,7 +25,7 @@ import { simulateRouter } from "./routes/simulate.js";
 import historyRouter from "./routes/history.js";
 import webhooksRouter from "./routes/webhooks.js";
 import { analyticsRouter } from "./routes/analytics.js";
-import { forecastRouter } from "./routes/analytics/forecast.js";
+import { benchmarkingRouter } from "./routes/analytics/benchmarking.js";
 import { contractRouter } from "./routes/contract.js";
 import { healthRouter } from "./routes/health.js";
 import { livenessRouter } from "./routes/liveness.js";
@@ -57,6 +57,7 @@ import { quickbooksRouter } from "./routes/accounting/quickbooks.js";
 import { contributorTaxRouter } from "./routes/contributor-tax.js";
 import { notificationsRouter } from "./routes/notifications.js";
 import { salesforceRouter } from "./routes/crm/salesforce.js";
+import { stripeRouter } from "./routes/payments/stripe.js";
 import { paymentHoldsRouter } from "./routes/payment-holds.js";
 import { earningsHistoryRouter } from "./routes/earnings-history.js";
 import { versionRouter } from "./routes/version.js";
@@ -369,6 +370,8 @@ app.use("/api/v1", webhooksRouter);
 app.use("/api/v1/analytics/forecast", readLimiter);
 app.use("/api/v1/analytics/forecast", forecastRouter);
 app.use("/api/v1", analyticsRouter);
+// Collaborator performance benchmarking (#952)
+app.use("/api/v1/analytics/benchmarking", benchmarkingRouter);
 app.use("/api/v1/contract", contractRouter);
 app.use("/api/v1/health", healthRouter);
 app.use(livenessRouter);
@@ -407,6 +410,10 @@ app.use("/api/v1/notifications", notificationsRouter);
 
 // SMS notification preferences (#927)
 app.use("/api/v1/notifications/sms", smsPreferencesRouter);
+
+// Stripe fiat payout integration (#924)
+app.use("/api/v1/payments/stripe", writeLimiter);
+app.use("/api/v1/payments/stripe", stripeRouter);
 
 // Payment hold/release system (#596)
 app.use("/api/v1/payment-holds", writeLimiter);
