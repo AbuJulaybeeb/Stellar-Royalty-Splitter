@@ -274,6 +274,10 @@ pub enum ExtKey {
     MetadataRateCache(Address, u64),
     /// #932 — `Vec<LinkedPool>` (persistent storage).
     LinkedContracts,
+    /// #955 — Governance token balance per account
+    GovBalance(Address),
+    /// #955 — Staked governance tokens per account
+    StakedGov(Address),
 }
 
 /// Maximum number of rate-change entries kept in history.
@@ -635,7 +639,13 @@ impl RoyaltySplitter {
                 return Err(ContractError::DuplicateRecipient);
             }
 
-            share_map.set(addr, share);
+            share_map.set(addr.clone(), share);
+            // #955 — Issue governance tokens 1:1 to basis points on setup
+            storage::persistent_set(
+                env,
+                &StorageKey::Ext(ExtKey::GovBalance(addr)),
+                &(share as i128),
+            );
         }
 
         let now = env.ledger().timestamp();
@@ -3394,12 +3404,10 @@ impl RoyaltySplitter {
         storage::extend_instance_ttl(&env);
         voter.require_auth();
 
-        let share_map: Map<Address, u32> =
-            storage::persistent_get::<Map<Address, u32>>(&env, &StorageKey::ShareMap)
-                .ok_or(ContractError::NoShareMap)?;
-        let weight = share_map
-            .get(voter.clone())
-            .ok_or(ContractError::CollaboratorNotFound)?;
+        let weight = Self::get_voting_weight(env.clone(), voter.clone());
+        if weight == 0 {
+            return Err(ContractError::CollaboratorNotFound);
+        }
 
         let mut proposals: Map<u64, Proposal> =
             storage::persistent_get::<Map<u64, Proposal>>(&env, &StorageKey::Proposals)
@@ -3500,6 +3508,147 @@ impl RoyaltySplitter {
             .ok_or(ContractError::ProposalNotFound)?
             .get(proposal_id)
             .ok_or(ContractError::ProposalNotFound)
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // #955 — Governance token & staking methods
+    // ─────────────────────────────────────────────────────────────────────────────
+
+    pub fn get_gov_balance(env: Env, account: Address) -> i128 {
+        storage::extend_instance_ttl(&env);
+        storage::persistent_get::<i128>(
+            &env,
+            &StorageKey::Ext(ExtKey::GovBalance(account)),
+        )
+        .unwrap_or(0)
+    }
+
+    pub fn get_staked_gov(env: Env, account: Address) -> storage::StakeInfo {
+        storage::extend_instance_ttl(&env);
+        storage::persistent_get::<storage::StakeInfo>(
+            &env,
+            &StorageKey::Ext(ExtKey::StakedGov(account)),
+        )
+        .unwrap_or(storage::StakeInfo {
+            staked_amount: 0,
+            pending_unstake_amount: 0,
+            cooldown_until: 0,
+        })
+    }
+
+    pub fn stake_gov_tokens(env: Env, from: Address, amount: i128) -> Result<(), ContractError> {
+        storage::extend_instance_ttl(&env);
+        from.require_auth();
+
+        if amount <= 0 {
+            return Err(ContractError::AmountNotPositive);
+        }
+
+        let balance = Self::get_gov_balance(env.clone(), from.clone());
+        if balance < amount {
+            return Err(ContractError::InsufficientBalance);
+        }
+
+        let mut stake_info = Self::get_staked_gov(env.clone(), from.clone());
+
+        storage::persistent_set(
+            &env,
+            &StorageKey::Ext(ExtKey::GovBalance(from.clone())),
+            &(balance.saturating_sub(amount)),
+        );
+
+        stake_info.staked_amount = stake_info.staked_amount.saturating_add(amount);
+        storage::persistent_set(
+            &env,
+            &StorageKey::Ext(ExtKey::StakedGov(from.clone())),
+            &stake_info,
+        );
+
+        env.events().publish(
+            (symbol_short!("gov"), symbol_short!("staked")),
+            (from, amount),
+        );
+        Ok(())
+    }
+
+    pub fn unstake_gov_tokens(env: Env, from: Address, amount: i128) -> Result<(), ContractError> {
+        storage::extend_instance_ttl(&env);
+        from.require_auth();
+
+        if amount <= 0 {
+            return Err(ContractError::AmountNotPositive);
+        }
+
+        let mut stake_info = Self::get_staked_gov(env.clone(), from.clone());
+        if stake_info.staked_amount < amount {
+            return Err(ContractError::InsufficientBalance);
+        }
+
+        stake_info.staked_amount = stake_info.staked_amount.saturating_sub(amount);
+        stake_info.pending_unstake_amount = stake_info.pending_unstake_amount.saturating_add(amount);
+        // 7 days cooldown = 7 * 86,400 = 604,800 seconds
+        stake_info.cooldown_until = env.ledger().timestamp().saturating_add(604_800);
+
+        storage::persistent_set(
+            &env,
+            &StorageKey::Ext(ExtKey::StakedGov(from.clone())),
+            &stake_info,
+        );
+
+        env.events().publish(
+            (symbol_short!("gov"), symbol_short!("unstk_req")),
+            (from, amount, stake_info.cooldown_until),
+        );
+        Ok(())
+    }
+
+    pub fn withdraw_unstaked_gov_tokens(env: Env, from: Address) -> Result<(), ContractError> {
+        storage::extend_instance_ttl(&env);
+        from.require_auth();
+
+        let mut stake_info = Self::get_staked_gov(env.clone(), from.clone());
+        if stake_info.pending_unstake_amount <= 0 {
+            return Err(ContractError::AmountNotPositive);
+        }
+
+        if env.ledger().timestamp() < stake_info.cooldown_until {
+            return Err(ContractError::InitRevealTooEarly);
+        }
+
+        let amount = stake_info.pending_unstake_amount;
+        stake_info.pending_unstake_amount = 0;
+        stake_info.cooldown_until = 0;
+
+        let balance = Self::get_gov_balance(env.clone(), from.clone());
+        storage::persistent_set(
+            &env,
+            &StorageKey::Ext(ExtKey::GovBalance(from.clone())),
+            &(balance.saturating_add(amount)),
+        );
+        storage::persistent_set(
+            &env,
+            &StorageKey::Ext(ExtKey::StakedGov(from.clone())),
+            &stake_info,
+        );
+
+        env.events().publish(
+            (symbol_short!("gov"), symbol_short!("unstk_done")),
+            (from, amount),
+        );
+        Ok(())
+    }
+
+    pub fn get_voting_weight(env: Env, voter: Address) -> u32 {
+        storage::extend_instance_ttl(&env);
+        let share_map: Map<Address, u32> =
+            storage::persistent_get::<Map<Address, u32>>(&env, &StorageKey::ShareMap)
+                .unwrap_or(Map::new(&env));
+        let base_shares = share_map.get(voter.clone()).unwrap_or(0);
+
+        let stake_info = Self::get_staked_gov(env.clone(), voter);
+        let staked_weight = (stake_info.staked_amount.saturating_mul(2)) as u32;
+
+        base_shares.saturating_add(staked_weight)
     }
 
     // ─────────────────────────────────────────────────────────────────────
