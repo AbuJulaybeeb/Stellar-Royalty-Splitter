@@ -553,6 +553,38 @@ export function initializeDatabase() {
         CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_log(action);
       `,
     },
+    {
+      // #950: Tax compliance reporting — 1099-NEC, T4A, EU-VAT form storage.
+      version: 18,
+      sql: `
+        CREATE TABLE IF NOT EXISTS tax_forms (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          walletAddress TEXT NOT NULL,
+          taxYear TEXT NOT NULL,
+          formType TEXT NOT NULL CHECK(formType IN ('1099-NEC', 'T4A', 'EU-VAT')),
+          country TEXT NOT NULL CHECK(country IN ('US', 'CA', 'EU')),
+          totalIncomeUsd INTEGER NOT NULL DEFAULT 0,
+          withheldUsd INTEGER NOT NULL DEFAULT 0,
+          formData TEXT NOT NULL DEFAULT '{}',
+          paymentBreakdown TEXT NOT NULL DEFAULT '[]',
+          status TEXT NOT NULL DEFAULT 'generated'
+            CHECK(status IN ('generated', 'void', 'amended')),
+          generatedBy TEXT NOT NULL DEFAULT 'system',
+          createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+          updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_tax_forms_wallet_year
+          ON tax_forms(walletAddress, taxYear);
+        CREATE INDEX IF NOT EXISTS idx_tax_forms_year
+          ON tax_forms(taxYear);
+        CREATE INDEX IF NOT EXISTS idx_tax_forms_type
+          ON tax_forms(formType, taxYear);
+        CREATE INDEX IF NOT EXISTS idx_tax_forms_country
+          ON tax_forms(country, taxYear);
+        CREATE INDEX IF NOT EXISTS idx_tax_forms_status
+          ON tax_forms(status, taxYear);
+      `,
+    },
   ];
 
   for (const migration of migrations) {
