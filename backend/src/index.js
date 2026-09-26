@@ -81,6 +81,8 @@ import { getPendingRoyaltyPools } from "./database/secondary-royalties.js";
 import { initRedisCache } from "./cache.js";
 import { openseaRouter } from "./routes/marketplaces/opensea.js";
 import { raribleRouter } from "./routes/marketplaces/rarible.js";
+import { smsPreferencesRouter } from "./routes/notifications/sms.js";
+import { taxReportsRouter } from "./routes/tax/reports.js";
 
 // Initialize database on startup
 initializeDatabase();
@@ -441,6 +443,10 @@ app.use("/api/v1/marketplaces/opensea", openseaRouter);
 // Rarible marketplace webhook integration (#954)
 app.use("/api/v1/marketplaces/rarible", writeLimiter);
 app.use("/api/v1/marketplaces/rarible", raribleRouter);
+
+// Tax compliance reporting — 1099-NEC, T4A, EU-VAT (#950)
+app.use("/api/v1/tax/reports", readLimiter);
+app.use("/api/v1/tax/reports", taxReportsRouter);
 
 // Admin operations (separate from /api/v1; protected by ADMIN_ROTATE_TOKEN)
 const RATE_LIMIT_ADMIN_WINDOW_MS = 60_000;
