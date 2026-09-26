@@ -165,4 +165,3 @@ pub struct StakeInfo {
     pub pending_unstake_amount: i128,
     pub cooldown_until: u64,
 }
-
