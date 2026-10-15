@@ -1140,7 +1140,11 @@ impl RoyaltySplitter {
     /// Core rate-set logic, shared by the admin-gated `set_royalty_rate`,
     /// the oracle refresh path, and governance execution. Does NOT perform
     /// authorization — callers are responsible for gating access first.
-    fn set_royalty_rate_value(env: &Env, new_rate: u32) -> Result<(), ContractError> {
+    fn set_royalty_rate_value(
+        env: &Env,
+        new_rate: u32,
+        caller: Address,
+    ) -> Result<(), ContractError> {
         if new_rate == 0 {
             return Err(ContractError::RoyaltyRateZero);
         }
@@ -1155,12 +1159,6 @@ impl RoyaltySplitter {
             .unwrap_or(0);
 
         storage::instance_set(env, &StorageKey::RoyaltyRate, &new_rate);
-
-        let caller: Address = env
-            .storage()
-            .instance()
-            .get(&StorageKey::Admin)
-            .ok_or(ContractError::NotInitialized)?;
 
         let mut history: Vec<RoyaltyRateChange> =
             storage::persistent_get::<Vec<RoyaltyRateChange>>(env, &StorageKey::RoyaltyRateHistory)
@@ -1193,7 +1191,8 @@ impl RoyaltySplitter {
     pub fn set_royalty_rate(env: Env, new_rate: u32) -> Result<(), ContractError> {
         storage::extend_instance_ttl(&env);
         Self::check_admin_auth(&env, auth::msg::SET_ROYALTY_RATE_ADMIN);
-        Self::set_royalty_rate_value(&env, new_rate)
+        let admin = Self::require_admin_address(&env)?;
+        Self::set_royalty_rate_value(&env, new_rate, admin)
     }
 
     pub fn get_royalty_rate_history(env: Env) -> Vec<RoyaltyRateChange> {
@@ -1329,7 +1328,7 @@ impl RoyaltySplitter {
         }
 
         let rate = Self::fetch_royalty_rate_from_oracle(env.clone())?;
-        Self::set_royalty_rate_value(&env, rate)?;
+        Self::set_royalty_rate_value(&env, rate, env.current_contract_address())?;
 
         config.last_updated = now;
         storage::instance_set(&env, &StorageKey::OracleConfig, &config);
@@ -4512,7 +4511,7 @@ impl RoyaltySplitter {
             return Ok(());
         }
 
-        Self::set_royalty_rate_value(&env, proposal.new_rate)?;
+        Self::set_royalty_rate_value(&env, proposal.new_rate, proposal.proposer.clone())?;
 
         proposal.executed = true;
         proposals.set(proposal_id, proposal.clone());
@@ -4866,6 +4865,7 @@ impl RoyaltySplitter {
     fn execute_sensitive_operation(
         env: &Env,
         operation: &SensitiveOperation,
+        caller: Address,
     ) -> Result<(), ContractError> {
         match operation {
             SensitiveOperation::Pause => {
@@ -4921,11 +4921,6 @@ impl RoyaltySplitter {
                     storage::instance_get::<u32>(env, &StorageKey::RoyaltyRate).unwrap_or(0);
                 storage::instance_set(env, &StorageKey::RoyaltyRate, new_rate);
                 let now = env.ledger().timestamp();
-                let caller = env
-                    .storage()
-                    .instance()
-                    .get::<StorageKey, Address>(&StorageKey::Admin)
-                    .unwrap_or(env.current_contract_address());
                 let entry = RoyaltyRateChange {
                     old_rate,
                     new_rate: *new_rate,
@@ -5066,7 +5061,7 @@ impl RoyaltySplitter {
 
         // If threshold is 1 (e.g. single admin or 1-of-N), execute immediately
         if threshold <= 1 {
-            Self::execute_sensitive_operation(&env, &operation)?;
+            Self::execute_sensitive_operation(&env, &operation, proposer.clone())?;
             proposal.executed = true;
             proposal.executed_at = now;
             env.events().publish(
@@ -5162,7 +5157,7 @@ impl RoyaltySplitter {
         );
 
         let executed = if proposal.approvals_count >= proposal.threshold {
-            Self::execute_sensitive_operation(&env, &proposal.operation)?;
+            Self::execute_sensitive_operation(&env, &proposal.operation, approver.clone())?;
             proposal.executed = true;
             proposal.executed_at = now;
             env.events().publish(
@@ -5735,7 +5730,7 @@ impl RoyaltySplitter {
         // Execute action conservatively
         match &proposal.action {
             GovProposalAction::ChangeRoyaltyRate(rate) => {
-                Self::set_royalty_rate_value(&env, *rate)?;
+                Self::set_royalty_rate_value(&env, *rate, proposal.proposer.clone())?;
             }
             GovProposalAction::SetTokenFeeOverride(token, fee_bps) => {
                 storage::instance_set(
