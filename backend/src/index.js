@@ -21,6 +21,7 @@ import { initializeRouter } from "./routes/initialize.js";
 import { distributeRouter } from "./routes/distribute.js";
 import { batchDistributeRouter } from "./routes/batch-distribute.js";
 import { collaboratorsRouter } from "./routes/collaborators.js";
+import { clearWarmTimers } from "./routes/collaborators.js";
 import { secondaryRoyaltyRouter } from "./routes/secondary-royalty.js";
 import { simulateRouter } from "./routes/simulate.js";
 import historyRouter from "./routes/history.js";
@@ -784,6 +785,8 @@ async function startServer() {
       if (typeof stopDeprecationTracking === "function") {
         stopDeprecationTracking();
       }
+      // Cancel all pending collaborator cache-warm timers (#1143)
+      clearWarmTimers();
     },
   });
 
