@@ -25,6 +25,7 @@ import {
 import { sendError } from "../error-response.js";
 import { pollHorizonTransaction } from "../stellar.js";
 import { deliverDistributeWebhooks } from "../webhook-delivery.js";
+import { broadcastToContract } from "../websocket.js";
 import logger from "../logger.js";
 import { recordDistributionLatency, recordDistributionOutcomeMetric } from "../metrics.js";
 import { cacheSet, cacheKey, TTL } from "../cache.js";
@@ -454,6 +455,19 @@ router.post("/transaction/confirm/:txHash", async (req, res) => {
 
     if (pollResult.status === "confirmed" && confirmed?.type === "distribute") {
       deliverDistributeWebhooks(confirmed);
+      // Real-time subscribers (earnings counters, notification panel) learn the
+      // distribution actually completed only now that it is confirmed on-chain
+      // (#1125). routes/distribute.js emits `distribution_prepared` earlier.
+      broadcastToContract(confirmed.contractId, {
+        type: "distribution_completed",
+        contractId: confirmed.contractId,
+        transactionId: confirmed.id,
+        txHash,
+        ledger: pollResult.ledger ?? null,
+        timestamp: new Date().toISOString(),
+        requestedAmount: confirmed.requestedAmount ?? null,
+        tokenId: confirmed.tokenId ?? null,
+      });
       // Advanced webhook system (#1059): fan out the signed
       // `distribution.completed` event to subscribed webhooks. Fail-open —
       // delivery problems must never fail the confirmation response.

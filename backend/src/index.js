@@ -482,6 +482,10 @@ app.use("/api/v1/analytics/benchmarking", benchmarkingRouter);
 // Advanced token economics & vesting analytics (#1062)
 app.use("/api/v1/tokenomics", readLimiter);
 app.use("/api/v1/tokenomics", tokenomicsRouter);
+// Contract upgrades build `update_wasm` transactions (#1127). Scoped to POST on
+// the upgrade paths so the read-only contract routes (GET /state, /info,
+// /balance/:id, /version/:id, …) keep the general limit.
+app.post(["/api/v1/contract/upgrade", "/api/v1/contract/upgrade/*"], writeLimiter);
 app.use("/api/v1/contract", contractRouter);
 app.use("/api/v1/health", healthRouter);
 app.use(livenessRouter);

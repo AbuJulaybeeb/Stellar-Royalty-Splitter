@@ -54,9 +54,6 @@ export const initializeSchema = z
 export const INITIALIZE_PAYLOAD_LIMIT_BYTES = 10 * 1024;
 export const INITIALIZE_COLLABORATORS_PAYLOAD_LIMIT_BYTES = 8 * 1024;
 
-// Named size limits ÔÇö kept in sync with on-chain MAX_COLLABORATORS / MAX_RECIPIENTS constants.
-export const MAX_COLLABORATORS_BACKEND = 20;
-
 // `.finite()` is load-bearing, not defensive: z.number().positive() is a plain
 // `> 0` test, and Infinity satisfies it. Without this the schema accepts
 // Infinity as a distribution amount, which then reaches BigInt() in

@@ -988,45 +988,48 @@ export const api = {
       `/v1/webhooks/${contractId}/delivery-stats`
     ),
 
-  // Feature Flag APIs
-  listFeatureFlags: () => get<{ success: boolean; data: FeatureFlag[] }>("/v1/feature-flags"),
+  // Feature Flag APIs — mirror backend/src/routes/feature-flags.js: flags are
+  // addressed by name, and responses are returned unwrapped (no
+  // `{ success, data }` envelope).
+  listFeatureFlags: () => get<{ flags: FeatureFlag[] }>("/v1/feature-flags"),
 
   createFeatureFlag: (body: {
     name: string;
-    description?: string;
+    description?: string | null;
     enabled?: boolean;
     rolloutPercentage?: number;
-  }) => post<{ success: boolean; data: FeatureFlag }>("/v1/feature-flags", body),
+  }) => post<FeatureFlag>("/v1/feature-flags", body),
 
-  updateFeatureFlag: (id: number, body: Partial<FeatureFlag>) =>
-    patch<{ success: boolean; data: FeatureFlag }>(`/v1/feature-flags/${id}`, body),
+  updateFeatureFlag: (name: string, body: Partial<Pick<FeatureFlag, "description" | "enabled">>) =>
+    patch<FeatureFlag>(`/v1/feature-flags/${encodeURIComponent(name)}`, body),
 
-  rollbackFeatureFlag: (id: number) =>
-    post<{ success: boolean; data: FeatureFlag }>(`/v1/feature-flags/${id}/rollback`, {}),
+  rollbackFeatureFlag: (name: string, reason = "Manual rollback") =>
+    post<FeatureFlag>(`/v1/feature-flags/${encodeURIComponent(name)}/rollback`, { reason }),
 
-  setFeatureFlagRollout: (id: number, percentage: number) =>
-    patch<{ success: boolean; data: FeatureFlag }>(`/v1/feature-flags/${id}/rollout`, {
-      rolloutPercentage: percentage,
-    }),
+  setFeatureFlagRollout: (name: string, percentage: number) =>
+    post<FeatureFlag>(`/v1/feature-flags/${encodeURIComponent(name)}/rollout`, { percentage }),
 
   addFeatureFlagRule: (
-    flagId: number,
-    body: { ruleType: string; value: string; enabled: boolean }
-  ) => post<{ success: boolean; data: FeatureFlagRule }>(`/v1/feature-flags/${flagId}/rules`, body),
+    name: string,
+    body: { ruleType: FeatureFlagRule["ruleType"]; value: string; enabled: boolean }
+  ) => post<FeatureFlagRule>(`/v1/feature-flags/${encodeURIComponent(name)}/rules`, body),
 
-  removeFeatureFlagRule: (flagId: number, ruleId: number) =>
-    del<{ success: boolean }>(`/v1/feature-flags/${flagId}/rules/${ruleId}`),
+  removeFeatureFlagRule: (name: string, ruleId: number) =>
+    del<{ success: boolean }>(`/v1/feature-flags/${encodeURIComponent(name)}/rules/${ruleId}`),
 
-  getFeatureFlagMetrics: (flagId: number) =>
-    get<{ success: boolean; data: FeatureFlagHealth }>(`/v1/feature-flags/${flagId}/metrics`),
+  getFeatureFlagMetrics: (name: string) =>
+    get<FeatureFlagHealth>(`/v1/feature-flags/${encodeURIComponent(name)}/metrics`),
 
-  getFeatureFlagHistory: (flagId: number) =>
-    get<{ success: boolean; data: FeatureFlagHistoryEntry[] }>(
-      `/v1/feature-flags/${flagId}/history`
+  getFeatureFlagHistory: (name: string) =>
+    get<{ flag: string; history: FeatureFlagHistoryEntry[] }>(
+      `/v1/feature-flags/${encodeURIComponent(name)}/history`
     ),
 
-  monitorFeatureFlag: (flagId: number) =>
-    get<{ success: boolean; data: FeatureFlagHealth }>(`/v1/feature-flags/${flagId}/monitor`),
+  monitorFeatureFlag: (name: string, body: { autoRollback?: boolean } = {}) =>
+    post<FeatureFlagHealth & { rolledBack: boolean }>(
+      `/v1/feature-flags/${encodeURIComponent(name)}/monitor`,
+      body
+    ),
 
   getPartnerAnalytics: (partnerId: string) =>
     get<{ success: boolean; data: PartnerAnalytics }>(`/v1/partners/${partnerId}/analytics`),

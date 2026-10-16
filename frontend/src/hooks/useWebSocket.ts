@@ -77,7 +77,11 @@ export function useWebSocket({ walletAddress, onNotification, onDistributionEven
             setConnected(true);
           }
 
-          // Handle distribution events for real-time earnings updates
+          // Handle distribution events for real-time earnings updates.
+          // `distribution_prepared` (unsigned XDR built, nothing submitted yet)
+          // is deliberately not forwarded: earnings only change once the
+          // backend confirms the transaction on-chain and emits
+          // `distribution_completed` (#1125).
           if (msg.type === "notification" && onDistributionEvent) {
             const data = msg.data as Record<string, unknown>;
             if (
