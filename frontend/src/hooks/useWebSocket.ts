@@ -7,7 +7,7 @@ interface WebSocketMessage {
 }
 
 export interface DistributionEvent {
-  type: "distribution_completed" | "secondary_distribution_completed" | "secondary_sale_recorded";
+  type: "distribution_prepared" | "distribution_completed" | "secondary_distribution_completed" | "secondary_sale_recorded";
   contractId: string;
   transactionId: string | number;
   timestamp: string;
@@ -81,6 +81,7 @@ export function useWebSocket({ walletAddress, onNotification, onDistributionEven
           if (msg.type === "notification" && onDistributionEvent) {
             const data = msg.data as Record<string, unknown>;
             if (
+              data.type === "distribution_prepared" ||
               data.type === "distribution_completed" ||
               data.type === "secondary_distribution_completed" ||
               data.type === "secondary_sale_recorded"
