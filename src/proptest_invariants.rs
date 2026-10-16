@@ -12,8 +12,8 @@
 
 #[cfg(test)]
 mod tests {
-    use proptest::prelude::*;
     use crate::MAX_COLLABORATORS;
+    use proptest::prelude::*;
 
     const SHARE_PRECISION: i128 = 10_000;
 
