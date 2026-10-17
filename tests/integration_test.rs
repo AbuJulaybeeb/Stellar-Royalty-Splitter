@@ -6699,6 +6699,93 @@ fn test_emergency_pause_multisig_threshold_and_signer_validations() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// #1129 — oracle-triggered rate change records contract address, not admin
+// ─────────────────────────────────────────────────────────────────────────────
+
+mod oracle_caller_history {
+    use super::*;
+    use soroban_sdk::{contract, contractimpl};
+    use stellar_royalty_splitter::{OracleAsset, OraclePriceData};
+
+    /// Stand-in for a SEP-40 price feed. Returns 0 decimals and a fixed price
+    /// of 750 (basis points) with the current ledger timestamp.
+    #[contract]
+    pub struct MockPriceFeedOracle;
+
+    #[contractimpl]
+    impl MockPriceFeedOracle {
+        /// Returns 0 decimals so price == basis-point rate directly.
+        pub fn decimals(_env: Env) -> u32 {
+            0
+        }
+
+        /// Returns a fresh price of 750 bps with the current ledger timestamp.
+        pub fn lastprice(env: Env, _asset: OracleAsset) -> Option<OraclePriceData> {
+            Some(OraclePriceData {
+                price: 750,
+                timestamp: env.ledger().timestamp(),
+            })
+        }
+    }
+
+    /// Issue #1129 — set_royalty_rate records the admin address as caller;
+    /// update_royalty_rate_from_oracle records the contract's own address instead.
+    #[test]
+    fn test_oracle_path_records_different_caller_than_admin() {
+        let env = Env::default();
+        env.mock_all_auths_allowing_non_root_auth();
+        env.ledger().with_mut(|l| l.timestamp = 1_000_000);
+
+        let (contract_id, client) = setup(&env);
+        let admin = Address::generate(&env);
+        let collab = Address::generate(&env);
+        client.initialize(
+            &vec![&env, admin.clone(), collab.clone()],
+            &vec![&env, 5_000_u32, 5_000_u32],
+        );
+
+        // Admin path: set_royalty_rate — caller should be the admin address.
+        client.set_royalty_rate(&500_u32);
+        let history_after_admin = client.get_royalty_rate_history();
+        let admin_entry = history_after_admin
+            .get(history_after_admin.len() - 1)
+            .expect("history must have an entry after set_royalty_rate");
+        assert_eq!(
+            admin_entry.caller, admin,
+            "admin-path caller must be the admin address"
+        );
+
+        // Oracle path: configure and trigger update_royalty_rate_from_oracle.
+        let oracle_id = env.register_contract(None, MockPriceFeedOracle);
+        client.set_royalty_oracle(
+            &oracle_id,
+            &OracleAsset::Other(soroban_sdk::symbol_short!("USD")),
+            &1_u64,    // update_frequency: 1 second
+            &3600_u64, // max_staleness: 1 hour
+        );
+        // Advance time so the frequency gate passes.
+        env.ledger().with_mut(|l| l.timestamp = 1_001_000);
+
+        client.update_royalty_rate_from_oracle();
+
+        let history_after_oracle = client.get_royalty_rate_history();
+        let oracle_entry = history_after_oracle
+            .get(history_after_oracle.len() - 1)
+            .expect("history must have an entry after oracle update");
+
+        // The oracle path must record the contract's own address — not the admin.
+        assert_eq!(
+            oracle_entry.caller, contract_id,
+            "oracle-path caller must be the contract's own address"
+        );
+        assert_ne!(
+            oracle_entry.caller, admin,
+            "oracle-path caller must differ from the admin address"
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // #933 — NFT metadata binding for dynamic rates
 // ─────────────────────────────────────────────────────────────────────────────
 
