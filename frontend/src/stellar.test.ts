@@ -285,7 +285,10 @@ describe("signAndSubmitTransaction", () => {
 
     // Use a zero-delay policy to verify the retry fires without setTimeout delays.
     const { submitTransactionWithRetry } = await import("./lib/submission-retry");
-    const promise = submitTransactionWithRetry(mocks.MockSorobanRpcServer.prototype, "signed-xdr", {
+    const mockServer = {
+      sendTransaction: mocks.sendTransaction,
+    };
+    const promise = submitTransactionWithRetry(mockServer, "signed-xdr", {
       policy: { maxRetries: 2, delaysMs: [0, 0] },
       onRetry,
     });
