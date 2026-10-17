@@ -31,6 +31,7 @@ export {
   getTransactionDetails,
   getTransactionById,
   getRetryEligibleTransactions,
+  getTransactionMetrics,
   RETRY_BACKOFF_MS,
   MAX_RETRY_COUNT,
 } from "./transactions.js";
@@ -622,4 +623,3 @@ export {
   upsertCarbonSettings,
   listAutoOffsetWallets,
 } from "./carbon.js";
-
